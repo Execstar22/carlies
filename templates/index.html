@@ -1,0 +1,2079 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PolyBots — BTC Up/Down Trading Dashboard</title>
+    <meta name="description"
+        content="Automated Polymarket BTC Up/Down paper trading bot dashboard with live market data, PnL tracking, and projections.">
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🤖</text></svg>">
+</head>
+
+<body>
+    <!-- Trading Mode Warning Banner -->
+    <div id="tradingModeBanner" style="display:none; background:linear-gradient(90deg,#dc2626,#b91c1c); color:#fff; text-align:center; padding:6px 16px; font-weight:700; font-size:0.85rem; letter-spacing:0.5px; position:sticky; top:0; z-index:9999;"></div>
+    <div class="app-shell">
+        <aside class="side-menu" id="sideMenu">
+            <div class="side-menu-top">
+                <button class="side-collapse-btn" id="sideCollapseBtn" onclick="toggleSideMenu()">☰</button>
+                <span class="side-title">PolyBots</span>
+            </div>
+            <nav class="side-nav">
+                <button class="side-nav-btn active" id="navDashboard" onclick="switchView('dashboard')">Dashboard</button>
+                <button class="side-nav-btn" id="navHistory" onclick="switchView('history')">History</button>
+                <button class="side-nav-btn" id="navProjection" onclick="switchView('projection')">Projection</button>
+                <button class="side-nav-btn" id="navDRA" onclick="switchView('dra')">DRA Analysis</button>
+            </nav>
+        </aside>
+        <main class="main-content">
+            <div class="container">
+                <div id="dashboardView">
+
+        <!-- ═══ Header ═══ -->
+        <header class="header" id="header">
+            <div class="header-left">
+                <span class="logo-icon">🤖</span>
+                <span class="logo">PolyBots</span>
+                <div id="botStatus" class="bot-status stopped">
+                    <span class="status-dot"></span>
+                    <span id="botStatusText">Connecting...</span>
+                </div>
+                <span id="tradingModeBadge" style="display:none; font-size:0.7rem; padding:2px 8px; border-radius:4px; font-weight:700; margin-left:8px;"></span>
+            </div>
+            <div class="header-right" style="display: flex; align-items: center; gap: 12px; position: relative;">
+                <span style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--text-secondary);">
+                    Balance: <strong id="headerBalance" style="color: var(--accent-primary);">$0.00</strong>
+                </span>
+
+                <!-- Notification Bell -->
+                <div style="position: relative;">
+                    <button id="notificationToggle" onclick="toggleNotifications()" style="background: none; border: none; cursor: pointer; font-size: 1.2rem; position: relative; padding: 4px; border-radius: 4px;">
+                        🔔
+                        <span id="notificationBadge" style="display: none; position: absolute; top: -2px; right: -2px; background: #ef4444; color: white; border-radius: 50%; padding: 2px 5px; font-size: 0.6rem; font-weight: bold; line-height: 1;">0</span>
+                    </button>
+                    <div id="notificationDropdown" style="display: none; position: absolute; right: 0; top: 100%; margin-top: 8px; background: var(--bg-secondary); border: 1px solid var(--border-primary); border-radius: 8px; width: 300px; max-height: 400px; overflow-y: auto; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); z-index: 1000; padding: 12px;">
+                        <h3 style="margin: 0 0 8px 0; font-size: 0.9rem; color: var(--text-primary); border-bottom: 1px solid var(--border-primary); padding-bottom: 8px;">Notifications</h3>
+                        <div id="notificationList" style="display: flex; flex-direction: column; gap: 8px;">
+                            <div style="color: var(--text-secondary); font-size: 0.8rem; text-align: center;">No new notifications</div>
+                        </div>
+                    </div>
+                </div>
+
+                <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="Toggle Dark/Light Mode">
+                    <div class="theme-toggle-knob">🌙</div>
+                </button>
+            </div>
+        </header>
+
+        <!-- ═══ Stats Grid ═══ -->
+        <section class="grid grid-4" id="statsGrid" style="margin-bottom: var(--space-xl);">
+            <div class="card stat-card">
+                <div class="stat-icon">💰</div>
+                <div class="stat-value neutral" id="statBalance">$0.00</div>
+                <div class="stat-label">Current Balance</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-icon">📈</div>
+                <div class="stat-value neutral" id="statPnl">$0.00</div>
+                <div class="stat-label">Total PnL</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-icon">🎯</div>
+                <div class="stat-value neutral" id="statWinRate">0%</div>
+                <div class="stat-label" title="Directional Resolve Accuracy (Prediksi Arah Benar)">DRA</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-icon">📊</div>
+                <div class="stat-value neutral" id="statROI">0%</div>
+                <div class="stat-label">ROI</div>
+            </div>
+        </section>
+
+        <!-- ═══ Balance Chart ═══ -->
+        <section style="margin-bottom: var(--space-xl);">
+            <div class="section-header">
+                <h2 class="section-title">📉 Balance Chart</h2>
+                <div style="display: flex; gap: var(--space-sm); align-items: center;">
+                    <span class="section-badge" id="balanceChartBadge" style="background: var(--bg-tertiary);">—</span>
+                    <button class="btn btn-outline" onclick="resetBalanceChart()" style="padding: 2px 8px; font-size: 0.75rem;" title="Reset chart view to start from current trade">🔄 Reset</button>
+                </div>
+            </div>
+            <div class="card balance-chart-card">
+                <div class="balance-chart-wrap">
+                    <canvas id="balanceChart" height="140"></canvas>
+                </div>
+                <div class="balance-chart-meta">
+                    <div class="projection-item" style="border-bottom: none; padding-bottom: 0;">
+                        <span class="projection-label">Range</span>
+                        <span class="projection-value" id="balanceChartRange">—</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══ Live Market ═══ -->
+        <section style="margin-bottom: var(--space-xl);">
+            <div class="section-header">
+                <h2 class="section-title">📡 Live Market</h2>
+                <span class="section-badge" id="liveBadge">LIVE</span>
+            </div>
+            <div class="card live-market" id="liveMarketCard">
+                <div id="liveContent">
+                    <div class="no-market">
+                        <div class="no-market-icon">🔍</div>
+                        <p>Searching for active market<span class="loading-dots"></span></p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══ Settings & Projection ═══ -->
+        <section style="margin-bottom: var(--space-xl);">
+            <div class="panel-grid">
+                <!-- Settings -->
+                <div class="card">
+                    <div class="section-header">
+                        <h2 class="section-title">⚙️ Trading Settings</h2>
+                    </div>
+
+                    <!-- Trading Mode Toggle -->
+                    <div style="margin-bottom:var(--space-md);">
+                        <label class="form-label">Trading Mode</label>
+                        <div class="btn-group" style="gap:6px;">
+                            <button class="btn" id="modeShadowBtn" onclick="setTradingMode('shadow')"
+                                style="flex:1;">👻 Shadow</button>
+                            <button class="btn" id="modeRealBtn" onclick="setTradingMode('real')"
+                                style="flex:1;">🔴 Real</button>
+                        </div>
+                    </div>
+
+                    <!-- Bet Amount -->
+                    <div class="form-group">
+                        <label class="form-label" for="capitalInput">Bet Amount per Trade (USD)</label>
+                        <input type="number" id="capitalInput" class="form-input" value="0.50" min="0.01"
+                            step="0.01" max="5.00" placeholder="0.50">
+                    </div>
+                    <!-- Shadow Balance (Only shown in Shadow mode) -->
+                    <div class="form-group" id="shadowBalanceGroup" style="display:none; margin-top:var(--space-md);">
+                        <label class="form-label" for="shadowCapitalInput">Shadow Balance (USD)</label>
+                        <div style="display:flex; gap:6px;">
+                            <input type="number" id="shadowCapitalInput" class="form-input" value="10.00" min="0.10"
+                                step="1.00" placeholder="10.00">
+                            <button class="btn btn-outline" onclick="updateShadowCapital()" style="flex:0 0 auto;">💾 Apply</button>
+                        </div>
+                        <small style="color:var(--text-secondary); font-size:0.75rem;">Mereset simulasi saldo & chart.</small>
+                    </div>
+
+                    <!-- Stop Profit -->
+                    <div style="margin-top:var(--space-md); padding:var(--space-sm); background:var(--bg-tertiary); border-radius:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                            <label class="form-label" style="margin:0;">🎯 Stop Profit</label>
+                            <button class="btn" id="stopProfitToggleBtn" onclick="toggleStopProfit()"
+                                style="padding:2px 10px; font-size:0.75rem; min-width:50px;">OFF</button>
+                        </div>
+                        <div style="display:flex; gap:6px; align-items:center;">
+                            <span style="color:var(--text-secondary); font-size:0.8rem; white-space:nowrap;">Target $</span>
+                            <input type="number" id="stopProfitInput" class="form-input" value="2.50" min="0.10"
+                                step="0.50" placeholder="2.50" style="flex:1;">
+                            <button class="btn btn-outline" onclick="applyStopProfit()" style="flex:0 0 auto; padding:4px 10px; font-size:0.75rem;">Apply</button>
+                        </div>
+                        <small style="color:var(--text-secondary); font-size:0.7rem;">Bot berhenti trade jika profit harian mencapai target.</small>
+                    </div>
+
+                    <!-- Scheduler -->
+                    <div style="margin-top:var(--space-sm); padding:var(--space-sm); background:var(--bg-tertiary); border-radius:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <label class="form-label" style="margin:0;">⏰ Scheduler (Wait 'til Midnight)</label>
+                                <small style="display:block; color:var(--text-secondary); font-size:0.7rem;">Pause bot sekarang & otomatis mulai trade jam 00:00 WIB.</small>
+                            </div>
+                            <button class="btn" id="schedulerToggleBtn" onclick="toggleScheduler()"
+                                style="padding:2px 10px; font-size:0.75rem; min-width:50px;">OFF</button>
+                        </div>
+                    </div>
+
+                    <div class="btn-group" style="margin-top:var(--space-md);">
+                        <button class="btn btn-primary" onclick="updateCapital()">💾 Apply Bet</button>
+                        <button class="btn btn-outline" id="toggleBotBtn" onclick="toggleBot()">⏸ Pause Bot</button>
+                        <button class="btn" id="killSwitchBtn" onclick="triggerKillSwitch()"
+                            style="background:#dc2626; color:#fff; border-color:#dc2626;">🛑 KILL SWITCH</button>
+                    </div>
+
+                    <!-- Wallet Info -->
+                    <div id="walletInfoPanel"
+                        style="margin-top:var(--space-md); padding:var(--space-sm); background:var(--bg-tertiary); border-radius:8px;">
+                        <div class="projection-item" style="border-bottom:none; padding-bottom:0;">
+                            <span class="projection-label">💼 Wallet (USDC)</span>
+                            <span class="projection-value" id="walletBalance">—</span>
+                        </div>
+                        <div class="projection-item" style="border-bottom:none; padding-bottom:0;">
+                            <span class="projection-label">Funder</span>
+                            <span class="projection-value" id="walletFunder" style="font-size:0.75rem;">—</span>
+                        </div>
+                    </div>
+
+                    <!-- Stats & Reset -->
+                    <div style="margin-top: var(--space-md);">
+                        <div class="projection-item">
+                            <span class="projection-label">Bet Amount</span>
+                            <span class="projection-value" id="settingCapital">$0.50</span>
+                        </div>
+                        <div class="projection-item">
+                            <span class="projection-label">Total Trades</span>
+                            <span class="projection-value" id="settingTotalTrades">0</span>
+                        </div>
+                        <div class="projection-item">
+                            <span class="projection-label">Wins / Losses</span>
+                            <span class="projection-value" id="settingWL">0 / 0</span>
+                        </div>
+                        <div class="projection-item">
+                            <span class="projection-label">Pending</span>
+                            <span class="projection-value" id="settingPending">0</span>
+                        </div>
+                    </div>
+                    <div style="margin-top:var(--space-sm);">
+                        <button class="btn btn-outline" onclick="resetHistory()"
+                            style="width:100%; font-size:0.75rem; color:var(--text-secondary);">🗑️ Reset All
+                            History</button>
+                    </div>
+                </div>
+
+                <!-- PnL Projection -->
+                <div class="card">
+                    <div class="section-header">
+                        <h2 class="section-title">🔮 PnL Projection</h2>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="projCapital">Custom Capital (USD)</label>
+                        <input type="number" id="projCapital" class="form-input" value="100" min="0.01" step="1"
+                            placeholder="100">
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn btn-primary" onclick="calcProjection()">📐 Calculate</button>
+                    </div>
+                    <div class="projection-results" id="projResults">
+                        <div class="projection-item">
+                            <span class="projection-label">Projected PnL</span>
+                            <span class="projection-value" id="projPnl">—</span>
+                        </div>
+                        <div class="projection-item">
+                            <span class="projection-label">Projected Balance</span>
+                            <span class="projection-value" id="projBalance">—</span>
+                        </div>
+                        <div class="projection-item">
+                            <span class="projection-label">Projected ROI</span>
+                            <span class="projection-value" id="projROI">—</span>
+                        </div>
+                        <div class="projection-item">
+                            <span class="projection-label" title="Directional Resolve Accuracy">DRA</span>
+                            <span class="projection-value" id="projWinRate">—</span>
+                        </div>
+                        <div class="projection-item">
+                            <span class="projection-label">Avg Return / Trade</span>
+                            <span class="projection-value" id="projAvgReturn">—</span>
+                        </div>
+                        <div class="projection-item"
+                            style="border-top: 2px solid var(--border-primary); padding-top: var(--space-sm); margin-top: var(--space-xs);">
+                            <span class="projection-label">Est. Daily PnL</span>
+                            <span class="projection-value" id="projDaily">—</span>
+                        </div>
+                        <div class="projection-item">
+                            <span class="projection-label">Est. Weekly PnL</span>
+                            <span class="projection-value" id="projWeekly">—</span>
+                        </div>
+                        <div class="projection-item">
+                            <span class="projection-label">Est. Monthly PnL</span>
+                            <span class="projection-value" id="projMonthly">—</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══ Trade History (Today WIB) ═══ -->
+        <section style="margin-bottom: var(--space-xl);">
+            <div class="section-header">
+                <h2 class="section-title">📋 Trade History</h2>
+                <div style="display: flex; gap: var(--space-sm); align-items: center;">
+                    <span class="section-badge" id="tradeCount">0 executed</span>
+                    <span class="section-badge" id="skipCount" style="background: var(--bg-tertiary);">0 skipped</span>
+                </div>
+            </div>
+            <div class="card" style="padding: 0; overflow: hidden;">
+                <div id="tradeTableContainer">
+                    <div class="empty-state" id="emptyTrades">
+                        <div class="empty-icon">📭</div>
+                        <p>No trades yet. The bot will trade when conditions are met.</p>
+                    </div>
+                    <div class="table-wrapper" id="tradeTableWrapper" style="display: none;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Time</th>
+                                    <th>Event</th>
+                                    <th>Side</th>
+                                    <th>Price</th>
+                                    <th>Bet</th>
+                                    <th>Shares</th>
+                                    <th>Countdown</th>
+                                    <th>Result</th>
+                                    <th>PnL</th>
+                                    <th>Balance</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tradeTableBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══ Skipped Events (Today WIB) ═══ -->
+        <section style="margin-bottom: var(--space-xl);">
+            <div class="section-header">
+                <h2 class="section-title">⏭ Skipped Events</h2>
+                <span class="section-badge" id="skippedBadge" style="background: var(--bg-tertiary);">0 events</span>
+            </div>
+            <div class="card" style="padding: 0; overflow: hidden;">
+                <div id="skippedTableContainer">
+                    <div class="empty-state" id="emptySkipped">
+                        <div class="empty-icon">✅</div>
+                        <p>No skipped events yet.</p>
+                    </div>
+                    <div class="table-wrapper" id="skippedTableWrapper" style="display: none;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Time</th>
+                                    <th>Event</th>
+                                    <th>Reason</th>
+                                    <th>UP Price</th>
+                                    <th>DOWN Price</th>
+                                    <th>Countdown</th>
+                                </tr>
+                            </thead>
+                            <tbody id="skippedTableBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+                </div>
+
+                <!-- ═══ History View ═══ -->
+                <div id="historyView" style="display: none;">
+                    <section style="margin-bottom: var(--space-xl);">
+                        <div class="section-header">
+                            <h2 class="section-title">🗂 History (WIB)</h2>
+                        </div>
+                        <div class="card" style="margin-bottom: var(--space-lg);">
+                            <div class="history-filter-grid">
+                                <div class="form-group">
+                                    <label class="form-label" for="historyDateFrom">From (WIB)</label>
+                                    <input type="date" id="historyDateFrom" class="form-input">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label" for="historyDateTo">To (WIB)</label>
+                                    <input type="date" id="historyDateTo" class="form-input">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label" for="historyResult">Trade Result</label>
+                                    <select id="historyResult" class="form-input">
+                                        <option value="">All</option>
+                                        <option value="WIN">WIN</option>
+                                        <option value="LOSS">LOSS</option>
+                                        <option value="PENDING">PENDING</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label" for="historySide">Trade Side</label>
+                                    <select id="historySide" class="form-input">
+                                        <option value="">All</option>
+                                        <option value="UP">UP</option>
+                                        <option value="DOWN">DOWN</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label" for="historyReason">Skipped Reason</label>
+                                    <select id="historyReason" class="form-input">
+                                        <option value="">All</option>
+                                        <option value="price">Price Out Of Range</option>
+                                        <option value="countdown_early">Countdown Too Early</option>
+                                        <option value="countdown_late">Countdown Too Late</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="btn-group">
+                                <button class="btn btn-primary" onclick="applyHistoryFilters()">Apply Filter</button>
+                                <button class="btn btn-outline" onclick="resetHistoryFilters()">Reset Filter</button>
+                            </div>
+                        </div>
+
+                        <div class="history-tabs">
+                            <button class="history-tab-btn active" id="historyTabTrades" onclick="switchHistoryTab('trades')">Trades</button>
+                            <button class="history-tab-btn" id="historyTabSkipped" onclick="switchHistoryTab('skipped')">Skipped</button>
+                        </div>
+
+                        <div id="historyTradesPanel">
+                            <div class="history-row-limit" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:var(--space-md);">
+                                <div>
+                                    <label for="historyTradeLimit">Rows:</label>
+                                    <select id="historyTradeLimit" class="form-input" onchange="historyTradePage=1; updateHistoryTrades()">
+                                        <option value="10">10</option>
+                                        <option value="20" selected>20</option>
+                                        <option value="50">50</option>
+                                    </select>
+                                </div>
+                                <div class="pagination-controls" style="display:flex; gap:var(--space-sm); align-items:center;">
+                                    <button class="form-btn" style="padding:4px 8px;" onclick="changeHistoryTradePage(-1)">Prev</button>
+                                    <span id="historyTradePageLabel" style="font-size:0.9em; color:var(--text-secondary);">Page 1</span>
+                                    <button class="form-btn" style="padding:4px 8px;" onclick="changeHistoryTradePage(1)">Next</button>
+                                </div>
+                            </div>
+                            <div class="card" style="padding: 0; overflow: hidden;">
+                                <div class="table-wrapper" id="historyTradeTableWrapper">
+                                    <table>
+                                        <thead>
+                                            <tr>
+                                                <th>#</th>
+                                                <th>Time</th>
+                                                <th>Event</th>
+                                                <th>Side</th>
+                                                <th>Price</th>
+                                                <th>Bet</th>
+                                                <th>Shares</th>
+                                                <th>Countdown</th>
+                                                <th>Result</th>
+                                                <th>PnL</th>
+                                                <th>Balance</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="historyTradeTableBody"></tbody>
+                                    </table>
+                                </div>
+                                <div class="empty-state" id="emptyHistoryTrades" style="display:none;">
+                                    <div class="empty-icon">📭</div>
+                                    <p>No historical trades for this filter.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="historySkippedPanel" style="display:none;">
+                            <div class="history-row-limit" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:var(--space-md);">
+                                <div>
+                                    <label for="historySkippedLimit">Rows:</label>
+                                    <select id="historySkippedLimit" class="form-input" onchange="historySkippedPage=1; updateHistorySkipped()">
+                                        <option value="10">10</option>
+                                        <option value="20" selected>20</option>
+                                        <option value="50">50</option>
+                                    </select>
+                                </div>
+                                <div class="pagination-controls" style="display:flex; gap:var(--space-sm); align-items:center;">
+                                    <button class="form-btn" style="padding:4px 8px;" onclick="changeHistorySkippedPage(-1)">Prev</button>
+                                    <span id="historySkippedPageLabel" style="font-size:0.9em; color:var(--text-secondary);">Page 1</span>
+                                    <button class="form-btn" style="padding:4px 8px;" onclick="changeHistorySkippedPage(1)">Next</button>
+                                </div>
+                            </div>
+                            <div class="card" style="padding: 0; overflow: hidden;">
+                                <div class="table-wrapper" id="historySkippedTableWrapper">
+                                    <table>
+                                        <thead>
+                                            <tr>
+                                                <th>#</th>
+                                                <th>Time</th>
+                                                <th>Event</th>
+                                                <th>Reason</th>
+                                                <th>UP Price</th>
+                                                <th>DOWN Price</th>
+                                                <th>Countdown</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="historySkippedTableBody"></tbody>
+                                    </table>
+                                </div>
+                                <div class="empty-state" id="emptyHistorySkipped" style="display:none;">
+                                    <div class="empty-icon">✅</div>
+                                    <p>No historical skipped events for this filter.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- ═══ Projection View ═══ -->
+                <div id="projectionView" style="display: none;">
+                    <section style="margin-bottom: var(--space-xl);">
+                        <div class="section-header">
+                            <h2 class="section-title">Projection</h2>
+                            <span class="section-badge" id="projectionRangeBadge">—</span>
+                        </div>
+
+                        <div class="card" style="margin-bottom: var(--space-lg);">
+                            <div class="history-filter-grid">
+                                <div class="form-group">
+                                    <label class="form-label" for="projectionPeriod">Period</label>
+                                    <select id="projectionPeriod" class="form-input">
+                                        <option value="today">Hari ini</option>
+                                        <option value="weekly">Mingguan</option>
+                                        <option value="monthly">Bulanan</option>
+                                        <option value="yearly">Tahunan</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label" for="projectionDateFrom">From (WIB)</label>
+                                    <input type="date" id="projectionDateFrom" class="form-input" min="2026-04-01" max="2099-12-31">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label" for="projectionDateTo">To (WIB)</label>
+                                    <input type="date" id="projectionDateTo" class="form-input" min="2026-04-01" max="2099-12-31">
+                                </div>
+                            </div>
+                            <div class="btn-group">
+                                <button class="btn btn-primary" onclick="applyProjectionFilters()">Apply</button>
+                                <button class="btn btn-outline" onclick="resetProjectionFilters()">Reset</button>
+                            </div>
+                        </div>
+
+                        <div class="history-tabs">
+                            <button class="history-tab-btn active" id="projectionToggleLine" onclick="switchProjectionChart('line')">Line</button>
+                            <button class="history-tab-btn" id="projectionTogglePie" onclick="switchProjectionChart('pie')">Pie</button>
+                        </div>
+
+                        <section class="grid grid-3" style="margin-bottom: var(--space-lg);">
+                            <div class="card stat-card">
+                                <div class="stat-label">Total WIN</div>
+                                <div class="stat-value positive" id="projChartWin">$0.00</div>
+                            </div>
+                            <div class="card stat-card">
+                                <div class="stat-label">Total LOSS</div>
+                                <div class="stat-value negative" id="projChartLoss">$0.00</div>
+                            </div>
+                            <div class="card stat-card">
+                                <div class="stat-label">Net</div>
+                                <div class="stat-value neutral" id="projChartNet">$0.00</div>
+                            </div>
+                        </section>
+
+                        <div class="card balance-chart-card">
+                            <div class="balance-chart-wrap projection-chart-wrap">
+                                <canvas id="projectionChartCanvas" height="220"></canvas>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- ═══ DRA View ═══ -->
+                <div id="draView" style="display: none;">
+                    <section style="margin-bottom: var(--space-xl);">
+                        <div class="section-header">
+                            <h2 class="section-title">🎯 DRA Analysis</h2>
+                        </div>
+                        <div class="card" style="margin-bottom: var(--space-lg);">
+                            <div class="history-filter-grid">
+                                <div class="form-group">
+                                    <label class="form-label" for="draDateFrom">From Date (WIB)</label>
+                                    <input type="date" id="draDateFrom" class="form-input">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label" for="draDateTo">To Date (WIB)</label>
+                                    <input type="date" id="draDateTo" class="form-input">
+                                </div>
+                            </div>
+                            <div class="btn-group">
+                                <button class="btn btn-primary" onclick="applyDRAFilters()">Calculate DRA</button>
+                                <button class="btn btn-outline" onclick="resetDRAFilters()">Reset</button>
+                            </div>
+                        </div>
+
+                        <section class="grid grid-3" style="margin-bottom: var(--space-lg);">
+                            <div class="card stat-card">
+                                <div class="stat-icon">🎯</div>
+                                <div class="stat-value neutral" id="draValue">0%</div>
+                                <div class="stat-label">Directional Resolve Accuracy</div>
+                            </div>
+                            <div class="card stat-card">
+                                <div class="stat-icon">✅</div>
+                                <div class="stat-value positive" id="draWins">0</div>
+                                <div class="stat-label">Correct Predictions (WIN)</div>
+                            </div>
+                            <div class="card stat-card">
+                                <div class="stat-icon">❌</div>
+                                <div class="stat-value negative" id="draLosses">0</div>
+                                <div class="stat-label">Incorrect Predictions (LOSS)</div>
+                            </div>
+                        </section>
+                        
+                        <div class="card" style="text-align: center; color: var(--text-secondary);">
+                            <p>Total Evaluated Trades: <strong id="draTotalTrades" style="color: var(--text-primary);">0</strong></p>
+                            <p style="font-size: 0.85rem; margin-top: 8px;">DRA mengukur seberapa sering bot menebak arah resolve market dengan benar, tanpa memperdulikan harga eksekusi (fill price).</p>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- ═══ JavaScript ═══ -->
+    <script>
+        (function () {
+            'use strict';
+
+            // ─── State ──────────────────────────────────────────────────────────
+            let currentTheme = localStorage.getItem('polybots-theme') || 'dark';
+            let botRunning = true;
+            let activeView = 'dashboard';
+            let historyTab = 'trades';
+            let projectionChartType = 'line';
+            let projectionData = { series: [], totals: { win_amount: 0, loss_amount: 0, net_amount: 0 } };
+            let projectionHoverIdx = -1;
+            let historyTradePage = 1;
+            let historySkippedPage = 1;
+
+            // Apply saved theme
+            document.documentElement.setAttribute('data-theme', currentTheme);
+            updateThemeIcon();
+
+            // ─── Theme Toggle ───────────────────────────────────────────────────
+            window.toggleTheme = function () {
+                currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
+                document.documentElement.setAttribute('data-theme', currentTheme);
+                localStorage.setItem('polybots-theme', currentTheme);
+                updateThemeIcon();
+                // Save to server
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ theme: currentTheme })
+                });
+            };
+
+            // ─── Side Menu & View Switch ───────────────────────────────────────
+            window.toggleSideMenu = function () {
+                document.body.classList.toggle('side-collapsed');
+            };
+
+            window.switchView = function (view) {
+                activeView = (view === 'history' || view === 'projection' || view === 'dra') ? view : 'dashboard';
+                document.getElementById('dashboardView').style.display = activeView === 'dashboard' ? '' : 'none';
+                document.getElementById('historyView').style.display = activeView === 'history' ? '' : 'none';
+                document.getElementById('projectionView').style.display = activeView === 'projection' ? '' : 'none';
+                document.getElementById('draView').style.display = activeView === 'dra' ? '' : 'none';
+                document.getElementById('navDashboard').classList.toggle('active', activeView === 'dashboard');
+                document.getElementById('navHistory').classList.toggle('active', activeView === 'history');
+                document.getElementById('navProjection').classList.toggle('active', activeView === 'projection');
+                document.getElementById('navDRA').classList.toggle('active', activeView === 'dra');
+                if (activeView === 'history') {
+                    refreshHistory();
+                } else if (activeView === 'projection') {
+                    refreshProjection();
+                } else if (activeView === 'dra') {
+                    refreshDRA();
+                }
+            };
+
+            window.switchHistoryTab = function (tab) {
+                historyTab = tab === 'skipped' ? 'skipped' : 'trades';
+                document.getElementById('historyTradesPanel').style.display = historyTab === 'trades' ? '' : 'none';
+                document.getElementById('historySkippedPanel').style.display = historyTab === 'skipped' ? '' : 'none';
+                document.getElementById('historyTabTrades').classList.toggle('active', historyTab === 'trades');
+                document.getElementById('historyTabSkipped').classList.toggle('active', historyTab === 'skipped');
+                refreshHistory();
+            };
+
+            // ─── DRA Analysis ──────────────────────────────────────────────────
+            window.applyDRAFilters = function() {
+                refreshDRA();
+            };
+
+            window.resetDRAFilters = function() {
+                document.getElementById('draDateFrom').value = '';
+                document.getElementById('draDateTo').value = '';
+                refreshDRA();
+            };
+
+            window.refreshDRA = function() {
+                const from = document.getElementById('draDateFrom').value;
+                const to = document.getElementById('draDateTo').value;
+                
+                fetch('/api/trades?limit=100000')
+                    .then(r => r.json())
+                    .then(trades => {
+                        let filtered = trades.filter(t => t.result === 'WIN' || t.result === 'LOSS');
+                        
+                        if (from || to) {
+                            filtered = filtered.filter(t => {
+                                const tDate = new Date(t.timestamp + (t.timestamp.endsWith('Z') ? '' : 'Z'));
+                                const wibTime = new Date(tDate.getTime() + 7 * 3600000);
+                                const dateStr = wibTime.toISOString().split('T')[0];
+                                
+                                if (from && dateStr < from) return false;
+                                if (to && dateStr > to) return false;
+                                return true;
+                            });
+                        }
+                        
+                        const total = filtered.length;
+                        const wins = filtered.filter(t => t.result === 'WIN').length;
+                        const losses = filtered.filter(t => t.result === 'LOSS').length;
+                        
+                        const dra = total > 0 ? (wins / total * 100) : 0;
+                        
+                        document.getElementById('draValue').textContent = dra.toFixed(1) + '%';
+                        document.getElementById('draValue').className = 'stat-value ' + (dra >= 50 ? 'positive' : dra > 0 ? 'negative' : 'neutral');
+                        document.getElementById('draWins').textContent = wins;
+                        document.getElementById('draLosses').textContent = losses;
+                        document.getElementById('draTotalTrades').textContent = total;
+                    })
+                    .catch(() => toast('Error fetching DRA data', 'error'));
+            };
+
+
+            function updateThemeIcon() {
+                const knob = document.querySelector('.theme-toggle-knob');
+                if (knob) knob.textContent = currentTheme === 'dark' ? '🌙' : '☀️';
+            }
+
+            // ─── Notifications ──────────────────────────────────────────────────
+            let currentNotifCount = 0;
+            let lastSeenNotifCount = 0;
+
+            window.toggleNotifications = function() {
+                const drop = document.getElementById('notificationDropdown');
+                drop.style.display = drop.style.display === 'none' ? 'block' : 'none';
+                
+                if (drop.style.display === 'block') {
+                    const badge = document.getElementById('notificationBadge');
+                    badge.style.display = 'none';
+                    badge.textContent = '0';
+                    lastSeenNotifCount = currentNotifCount;
+                }
+            };
+            
+            document.addEventListener('click', (e) => {
+                const drop = document.getElementById('notificationDropdown');
+                const btn = document.getElementById('notificationToggle');
+                if (drop && drop.style.display === 'block' && !drop.contains(e.target) && !btn.contains(e.target)) {
+                    drop.style.display = 'none';
+                }
+            });
+
+            // ─── Format Helpers ─────────────────────────────────────────────────
+            function fmt$(v, decimals = 4) {
+                if (v === null || v === undefined) return '—';
+                const n = parseFloat(v);
+                return (n >= 0 ? '+' : '') + '$' + n.toFixed(decimals);
+            }
+
+            function fmtCents(v) {
+                if (v === null || v === undefined) return '—';
+                return (parseFloat(v) * 100).toFixed(1) + '¢';
+            }
+
+            function fmtTime(iso) {
+                if (!iso) return '—';
+                const d = new Date(iso + (iso.endsWith('Z') ? '' : 'Z'));
+                return d.toLocaleString('en-GB', {
+                    month: 'short', day: 'numeric',
+                    hour: '2-digit', minute: '2-digit', second: '2-digit'
+                });
+            }
+
+            function pnlClass(v) {
+                if (v > 0) return 'pnl-positive';
+                if (v < 0) return 'pnl-negative';
+                return '';
+            }
+
+            function valClass(v) {
+                if (v > 0) return 'positive';
+                if (v < 0) return 'negative';
+                return 'neutral';
+            }
+
+            // ─── Toast Notification ─────────────────────────────────────────────
+            function toast(msg, type = 'success') {
+                const el = document.createElement('div');
+                el.className = `toast toast-${type}`;
+                el.textContent = msg;
+                document.body.appendChild(el);
+                setTimeout(() => el.remove(), 3000);
+            }
+
+            // ─── Update Stats ───────────────────────────────────────────────────
+            function updateStats() {
+                fetch('/api/stats')
+                    .then(r => r.json())
+                    .then(data => {
+                        const bal = data.current_balance;
+                        const pnl = data.total_pnl;
+
+                        document.getElementById('statBalance').textContent = '$' + bal.toFixed(4);
+                        document.getElementById('statBalance').className = 'stat-value ' + valClass(bal - data.starting_capital);
+
+                        document.getElementById('statPnl').textContent = fmt$(pnl);
+                        document.getElementById('statPnl').className = 'stat-value ' + valClass(pnl);
+
+                        document.getElementById('statWinRate').textContent = data.win_rate.toFixed(1) + '%';
+                        document.getElementById('statWinRate').className = 'stat-value ' + (data.win_rate >= 50 ? 'positive' : data.win_rate > 0 ? 'negative' : 'neutral');
+
+                        document.getElementById('statROI').textContent = data.roi.toFixed(1) + '%';
+                        document.getElementById('statROI').className = 'stat-value ' + valClass(data.roi);
+
+                        document.getElementById('headerBalance').textContent = '$' + bal.toFixed(2);
+
+                        // Populate bet amount from settings
+                        fetch('/api/settings').then(r => r.json()).then(s => {
+                            const betAmt = s.real_bet_amount || 0.50;
+                            document.getElementById('settingCapital').textContent = '$' + betAmt.toFixed(2);
+                            if (document.activeElement !== document.getElementById('capitalInput')) {
+                                document.getElementById('capitalInput').value = betAmt.toFixed(2);
+                            }
+                            if (s.trading_mode === 'shadow') {
+                                document.getElementById('shadowBalanceGroup').style.display = 'block';
+                                if (document.activeElement !== document.getElementById('shadowCapitalInput')) {
+                                    document.getElementById('shadowCapitalInput').value = (s.shadow_capital || 10).toFixed(2);
+                                }
+                                document.getElementById('statBalance').textContent = '$' + (data.shadow_balance || 0).toFixed(4);
+                                document.getElementById('statBalance').className = 'stat-value ' + valClass((data.shadow_balance || 0) - (s.shadow_capital || 10));
+                                document.getElementById('headerBalance').textContent = '$' + (data.shadow_balance || 0).toFixed(2);
+                            } else {
+                                document.getElementById('shadowBalanceGroup').style.display = 'none';
+                                // In real mode, show wallet USDC balance
+                                fetch('/api/wallet').then(r => r.json()).then(w => {
+                                    if (w.balance !== null && w.balance !== undefined) {
+                                        const wb = parseFloat(w.balance);
+                                        document.getElementById('statBalance').textContent = '$' + wb.toFixed(4);
+                                        document.getElementById('statBalance').className = 'stat-value ' + (wb > 0 ? 'positive' : 'neutral');
+                                        document.getElementById('headerBalance').textContent = '$' + wb.toFixed(2);
+                                    }
+                                }).catch(() => {});
+                            }
+                        }).catch(() => {});
+
+                        document.getElementById('settingTotalTrades').textContent = data.total_trades;
+                        document.getElementById('settingWL').textContent = data.wins + ' / ' + data.losses;
+                        document.getElementById('settingPending').textContent = data.pending;
+                    })
+                    .catch(() => { });
+            }
+
+            // ─── Balance Chart ────────────────────────────────────────────────
+            let balanceChartFromId = parseInt(localStorage.getItem('polybots-chart-from-id')) || 0;
+            let balanceChartData = [];
+            let balanceChartHoverIdx = -1;
+
+            window.resetBalanceChart = function() {
+                fetch('/api/trades?limit=1')
+                    .then(r => r.json())
+                    .then(trades => {
+                        if (trades && trades.length > 0) {
+                            balanceChartFromId = trades[0].id + 1; // Set to the NEXT trade ID to start with 0 trades
+                            localStorage.setItem('polybots-chart-from-id', balanceChartFromId);
+                            toast('Chart reset (waiting for next trade)');
+                            updateBalanceChart();
+                        } else {
+                            toast('No trades available to reset to', 'error');
+                        }
+                    })
+                    .catch(() => toast('Error resetting chart', 'error'));
+            };
+
+            function setCanvasSize(canvas) {
+                const dpr = window.devicePixelRatio || 1;
+                const rect = canvas.getBoundingClientRect();
+                const w = Math.max(10, Math.floor(rect.width));
+                const h = Math.max(10, Math.floor(rect.height));
+                const ctx = canvas.getContext('2d');
+                const targetW = Math.floor(w * dpr);
+                const targetH = Math.floor(h * dpr);
+                // Avoid resetting backing store on every hover redraw.
+                // Re-size only when container dimensions actually change.
+                if (canvas.width !== targetW || canvas.height !== targetH) {
+                    canvas.width = targetW;
+                    canvas.height = targetH;
+                }
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                return { w, h, dpr };
+            }
+
+            function drawBalanceChart() {
+                const canvas = document.getElementById('balanceChart');
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return;
+
+                const { w, h } = setCanvasSize(canvas);
+                ctx.clearRect(0, 0, w, h);
+
+                const pad = { l: 44, r: 14, t: 12, b: 26 };
+                const innerW = w - pad.l - pad.r;
+                const innerH = h - pad.t - pad.b;
+
+                // Background grid
+                ctx.strokeStyle = 'rgba(148,163,184,0.18)';
+                ctx.lineWidth = 1;
+                for (let i = 0; i <= 4; i++) {
+                    const y = pad.t + (innerH * i) / 4;
+                    ctx.beginPath();
+                    ctx.moveTo(pad.l, y);
+                    ctx.lineTo(pad.l + innerW, y);
+                    ctx.stroke();
+                }
+
+                const points = balanceChartData;
+                if (!points || points.length < 2) {
+                    ctx.fillStyle = 'rgba(148,163,184,0.8)';
+                    ctx.font = '12px var(--font-mono)';
+                    ctx.fillText('Not enough data (need 2+ trades)', pad.l, pad.t + 20);
+                    return;
+                }
+
+                const ys = points.map(p => p.balance);
+                let minY = 0; // Always start chart from $0
+                let maxY = Math.max(...ys);
+                if (maxY <= minY) {
+                    maxY += 1;
+                }
+                const yPad = (maxY - minY) * 0.1;
+                maxY += yPad;
+
+                const xFor = (i) => pad.l + (innerW * i) / (points.length - 1);
+                const yFor = (v) => pad.t + innerH * (1 - (v - minY) / (maxY - minY));
+
+                // Axis labels (each grid line)
+                ctx.fillStyle = 'rgba(148,163,184,0.9)';
+                ctx.font = '11px var(--font-mono)';
+                ctx.textAlign = 'right';
+                ctx.textBaseline = 'middle';
+                for (let i = 0; i <= 4; i++) {
+                    const ratio = 1 - (i / 4);
+                    const yVal = minY + (maxY - minY) * ratio;
+                    const y = pad.t + (innerH * i) / 4;
+                    ctx.fillText('$' + yVal.toFixed(2), pad.l - 6, y);
+                }
+
+                // Line
+                ctx.strokeStyle = 'rgba(99,102,241,0.95)';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                points.forEach((p, i) => {
+                    const x = xFor(i);
+                    const y = yFor(p.balance);
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+
+                // End dot
+                const last = points[points.length - 1];
+                const lx = xFor(points.length - 1);
+                const ly = yFor(last.balance);
+                ctx.fillStyle = 'rgba(16,185,129,0.95)';
+                ctx.beginPath();
+                ctx.arc(lx, ly, 3.5, 0, Math.PI * 2);
+                ctx.fill();
+
+                // X labels (first/last trade id)
+                ctx.fillStyle = 'rgba(148,163,184,0.9)';
+                ctx.font = '11px var(--font-mono)';
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'top';
+                ctx.fillText('#' + points[0].id, pad.l, pad.t + innerH + 6);
+                ctx.textAlign = 'right';
+                ctx.fillText('#' + last.id, pad.l + innerW, pad.t + innerH + 6);
+
+                // Hover marker + tooltip
+                if (balanceChartHoverIdx >= 0 && balanceChartHoverIdx < points.length) {
+                    const hp = points[balanceChartHoverIdx];
+                    const hx = xFor(balanceChartHoverIdx);
+                    const hy = yFor(hp.balance);
+
+                    // crosshair
+                    ctx.strokeStyle = 'rgba(148,163,184,0.45)';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(hx, pad.t);
+                    ctx.lineTo(hx, pad.t + innerH);
+                    ctx.stroke();
+
+                    // point highlight
+                    ctx.fillStyle = 'rgba(99,102,241,1)';
+                    ctx.beginPath();
+                    ctx.arc(hx, hy, 4, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    const tip1 = '#' + hp.id;
+                    const tip2 = '$' + hp.balance.toFixed(4);
+                    ctx.font = '11px var(--font-mono)';
+                    const tw = Math.max(ctx.measureText(tip1).width, ctx.measureText(tip2).width) + 16;
+                    const th = 34;
+                    const tx = Math.min(Math.max(hx - tw / 2, pad.l), pad.l + innerW - tw);
+                    const ty = Math.max(pad.t + 4, hy - th - 8);
+
+                    ctx.fillStyle = 'rgba(15,23,42,0.92)';
+                    ctx.fillRect(tx, ty, tw, th);
+                    ctx.strokeStyle = 'rgba(99,102,241,0.55)';
+                    ctx.strokeRect(tx, ty, tw, th);
+
+                    ctx.fillStyle = 'rgba(241,245,249,0.95)';
+                    ctx.textAlign = 'left';
+                    ctx.textBaseline = 'top';
+                    ctx.fillText(tip1, tx + 8, ty + 5);
+                    ctx.fillText(tip2, tx + 8, ty + 18);
+                }
+            }
+
+            function updateBalanceChart() {
+                fetch('/api/trades?limit=10000')
+                    .then(r => r.json())
+                    .then(trades => {
+                        // trades come newest-first from backend
+                        const filtered = trades
+                            .filter(t => t.id >= balanceChartFromId)
+                            .sort((a, b) => a.id - b.id);
+
+                        balanceChartData = filtered.map(t => ({
+                            id: t.id,
+                            balance: parseFloat(t.balance_after)
+                        })).filter(p => Number.isFinite(p.balance));
+
+                        const badge = document.getElementById('balanceChartBadge');
+                        const range = document.getElementById('balanceChartRange');
+                        if (badge) badge.textContent = balanceChartData.length + ' pts';
+
+                        if (range && balanceChartData.length) {
+                            const first = balanceChartData[0];
+                            const last = balanceChartData[balanceChartData.length - 1];
+                            range.textContent = `#${first.id}→#${last.id}`;
+                        } else if (range) {
+                            range.textContent = '—';
+                        }
+
+                        drawBalanceChart();
+                    })
+                    .catch(() => { });
+            }
+
+            function updateBalanceChartHover(evt) {
+                const canvas = document.getElementById('balanceChart');
+                if (!canvas || balanceChartData.length < 2) return;
+                const rect = canvas.getBoundingClientRect();
+                const x = evt.clientX - rect.left;
+                const pad = { l: 44, r: 14 };
+                const innerW = rect.width - pad.l - pad.r;
+                if (innerW <= 0 || x < pad.l || x > (pad.l + innerW)) {
+                    if (balanceChartHoverIdx !== -1) {
+                        balanceChartHoverIdx = -1;
+                        drawBalanceChart();
+                    }
+                    return;
+                }
+                const ratio = (x - pad.l) / innerW;
+                const idx = Math.round(ratio * (balanceChartData.length - 1));
+                if (idx !== balanceChartHoverIdx) {
+                    balanceChartHoverIdx = idx;
+                    drawBalanceChart();
+                }
+            }
+
+            // ─── Update Live Market ─────────────────────────────────────────────
+            function updateLive() {
+                fetch('/api/live')
+                    .then(r => r.json())
+                    .then(data => {
+                        // Bot status
+                        const statusEl = document.getElementById('botStatus');
+                        const statusText = document.getElementById('botStatusText');
+                        botRunning = data.running;
+
+                        if (data.running) {
+                            statusEl.className = 'bot-status running';
+                            statusText.textContent = 'Running';
+                            document.getElementById('toggleBotBtn').innerHTML = '⏸ Pause Bot';
+                        } else {
+                            statusEl.className = 'bot-status stopped';
+                            statusText.textContent = 'Paused';
+                            document.getElementById('toggleBotBtn').innerHTML = '▶ Resume Bot';
+                        }
+
+                        // Trading mode UI
+                        const mode = data.trading_mode || 'shadow';
+                        const banner = document.getElementById('tradingModeBanner');
+                        const badge = document.getElementById('tradingModeBadge');
+                        if (mode === 'real') {
+                            banner.style.display = '';
+                            banner.textContent = '🔴 REAL TRADING MODE — Uang asli sedang digunakan!';
+                            banner.style.background = 'linear-gradient(90deg,#dc2626,#b91c1c)';
+                            badge.style.display = '';
+                            badge.textContent = '🔴 REAL';
+                            badge.style.background = '#dc2626';
+                            badge.style.color = '#fff';
+                        } else {
+                            banner.style.display = '';
+                            banner.textContent = '👻 SHADOW MODE — Bot berjalan tapi TIDAK place order (testing)';
+                            banner.style.background = 'linear-gradient(90deg,#7c3aed,#6d28d9)';
+                            badge.style.display = '';
+                            badge.textContent = '👻 SHADOW';
+                            badge.style.background = '#7c3aed';
+                            badge.style.color = '#fff';
+                        }
+                        if (typeof updateModeButtons === 'function') updateModeButtons(mode);
+
+                        // Balance — real mode uses wallet balance from /api/wallet (updateWallet/updateStats)
+                        if (mode !== 'real' && data.balance !== null && data.balance !== undefined) {
+                            document.getElementById('headerBalance').textContent = '$' + parseFloat(data.balance).toFixed(2);
+                        }
+
+                        // Market data
+                        const container = document.getElementById('liveContent');
+                        const market = data.current_market;
+
+                        if (!market) {
+                            container.innerHTML = `
+                        <div class="no-market">
+                            <div class="no-market-icon">🔍</div>
+                            <p>Searching for active market<span class="loading-dots"></span></p>
+                        </div>`;
+                            return;
+                        }
+
+                        const upPrice = data.up_price !== null ? data.up_price : null;
+                        const downPrice = data.down_price !== null ? data.down_price : null;
+                        const countdown = data.countdown_display || '--:--';
+                        const countdownSec = data.countdown || 0;
+
+                        // Check if in buy window
+                        const buyStart = data.countdown_buy_start !== undefined ? data.countdown_buy_start : 150;
+                        const inWindow = countdownSec >= 0 && countdownSec <= buyStart;
+                        const windowClass = inWindow ? 'color: var(--accent-warning)' : '';
+
+                        container.innerHTML = `
+                    <div class="market-info">
+                        <div class="market-question">${market.question || market.slug}</div>
+                        <div class="countdown-display">
+                            <div class="countdown-value" style="${windowClass}">${countdown}</div>
+                            <div class="countdown-label">${inWindow ? '🎯 BUY WINDOW' : 'Remaining'}</div>
+                        </div>
+                    </div>
+                    <div class="price-grid">
+                        <div class="price-card up">
+                            <div class="price-direction">📈 UP</div>
+                            <div class="price-value">${upPrice !== null ? fmtCents(upPrice) : '—'}</div>
+                            <div class="price-unit">${upPrice !== null && upPrice <= 0.80 ? '✅ Below threshold' : ''}</div>
+                        </div>
+                        <div class="price-card down">
+                            <div class="price-direction">📉 DOWN</div>
+                            <div class="price-value">${downPrice !== null ? fmtCents(downPrice) : '—'}</div>
+                            <div class="price-unit">${downPrice !== null && downPrice <= 0.80 ? '✅ Below threshold' : ''}</div>
+                        </div>
+                    </div>`;
+
+                        // Notifications
+                        if (data.notifications) {
+                            const list = document.getElementById('notificationList');
+                            currentNotifCount = data.notifications.length;
+                            
+                            if (currentNotifCount === 0) {
+                                list.innerHTML = '<div style="color: var(--text-secondary); font-size: 0.8rem; text-align: center;">No new notifications</div>';
+                            } else {
+                                list.innerHTML = data.notifications.slice().reverse().map(n => `
+                                    <div style="font-size: 0.8rem; border-bottom: 1px solid var(--border-primary); padding-bottom: 6px;">
+                                        <div style="color: var(--text-secondary); font-size: 0.7rem; margin-bottom: 2px;">${n.time}</div>
+                                        <div style="color: var(--accent-warning);">${n.msg}</div>
+                                    </div>
+                                `).join('');
+                            }
+                            
+                            const unseen = currentNotifCount - lastSeenNotifCount;
+                            const badge = document.getElementById('notificationBadge');
+                            if (unseen > 0 && document.getElementById('notificationDropdown').style.display !== 'block') {
+                                badge.style.display = 'block';
+                                badge.textContent = unseen;
+                            }
+                        }
+                    })
+                    .catch(() => { });
+            }
+
+            // ─── Update Trades ──────────────────────────────────────────────────
+            function updateTrades() {
+                fetch('/api/trades?scope=today_utc&limit=500')
+                    .then(r => r.json())
+                    .then(trades => {
+                        const badge = document.getElementById('tradeCount');
+                        badge.textContent = trades.length + ' executed';
+
+                        if (trades.length === 0) {
+                            document.getElementById('emptyTrades').style.display = '';
+                            document.getElementById('tradeTableWrapper').style.display = 'none';
+                            return;
+                        }
+
+                        document.getElementById('emptyTrades').style.display = 'none';
+                        document.getElementById('tradeTableWrapper').style.display = '';
+
+                        const tbody = document.getElementById('tradeTableBody');
+                        tbody.innerHTML = trades.map(t => {
+                            let resultBadge = '';
+                            if (t.result === 'WIN') resultBadge = '<span class="badge badge-win">WIN</span>';
+                            else if (t.result === 'LOSS') resultBadge = '<span class="badge badge-loss">LOSS</span>';
+                            else if (t.result === 'PENDING') resultBadge = '<span class="badge badge-pending">PENDING</span>';
+                            else resultBadge = `<span class="badge" style="background:var(--bg-secondary); color:var(--text-secondary)">${t.result}</span>`;
+
+                            const sideBadge = t.side === 'UP'
+                                ? '<span class="badge badge-up">▲ UP</span>'
+                                : '<span class="badge badge-down">▼ DOWN</span>';
+
+                            const pnlStr = t.result === 'PENDING' ? '—' : fmt$(t.pnl);
+                            const pnlCls = t.result === 'PENDING' ? '' : pnlClass(t.pnl);
+
+                            // Extract event time from market_question
+                            // e.g. "Bitcoin Up or Down - March 5, 7:30PM-7:35PM ET" → "March 5, 7:30PM-7:35PM ET"
+                            const question = t.market_question || '';
+                            const dashIdx = question.indexOf(' - ');
+                            const eventTime = dashIdx !== -1 ? question.substring(dashIdx + 3) : (t.market_slug || '—');
+
+                            let cdStr = '—';
+                            if (t.end_time && t.end_time > 0 && t.timestamp) {
+                                let tsIso = t.timestamp;
+                                if (!tsIso.endsWith('Z')) tsIso += 'Z';
+                                const tsSec = new Date(tsIso).getTime() / 1000;
+                                const cd = t.end_time - tsSec;
+                                const m = Math.floor(Math.abs(cd) / 60);
+                                const s = Math.floor(Math.abs(cd) % 60);
+                                cdStr = (cd < 0 ? '-' : '') + m + ':' + String(s).padStart(2, '0');
+                            }
+
+                            return `<tr>
+                        <td>${t.id}</td>
+                        <td>${fmtTime(t.timestamp)}</td>
+                        <td title="${question}">${eventTime}</td>
+                        <td>${sideBadge}</td>
+                        <td>${fmtCents(t.entry_price)}</td>
+                        <td>$${parseFloat(t.bet_amount).toFixed(4)}</td>
+                        <td>${parseFloat(t.shares).toFixed(4)}</td>
+                        <td>${cdStr}</td>
+                        <td>${resultBadge}</td>
+                        <td class="${pnlCls}">${pnlStr}</td>
+                        <td>$${parseFloat(t.balance_after).toFixed(4)}</td>
+                    </tr>`;
+                        }).join('');
+                    })
+                    .catch(() => { });
+            }
+
+            // ─── Settings Actions ───────────────────────────────────────────────
+            window.updateShadowCapital = function() {
+                const val = parseFloat(document.getElementById('shadowCapitalInput').value);
+                if (isNaN(val) || val <= 0) return toast('Invalid shadow capital amount', 'error');
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ shadow_capital: val })
+                }).then(() => {
+                    toast('Shadow balance updated to $' + val.toFixed(2));
+                    updateStats();
+                    updateBalanceChart();
+                }).catch(e => toast('Error updating shadow balance', 'error'));
+            };
+
+            window.toggleStopProfit = function() {
+                fetch('/api/settings').then(r => r.json()).then(s => {
+                    const newVal = !s.stop_profit_enabled;
+                    fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ stop_profit_enabled: newVal })
+                    }).then(() => {
+                        toast('Stop Profit ' + (newVal ? 'ON' : 'OFF'));
+                        syncFeatureToggles();
+                    });
+                });
+            };
+
+            window.applyStopProfit = function() {
+                const val = parseFloat(document.getElementById('stopProfitInput').value);
+                if (isNaN(val) || val <= 0) return toast('Invalid stop profit target', 'error');
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ stop_profit_target: val, stop_profit_enabled: true })
+                }).then(() => {
+                    toast('Stop Profit target set to $' + val.toFixed(2) + ' (ON)');
+                    syncFeatureToggles();
+                }).catch(() => toast('Error', 'error'));
+            };
+
+            window.toggleScheduler = function() {
+                fetch('/api/settings').then(r => r.json()).then(s => {
+                    const newVal = !s.scheduler_enabled;
+                    fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ scheduler_enabled: newVal })
+                    }).then(() => {
+                        toast('Scheduler ' + (newVal ? 'ON (Paused until 00:00)' : 'OFF'));
+                        syncFeatureToggles();
+                    });
+                });
+            };
+
+            function syncFeatureToggles() {
+                fetch('/api/settings').then(r => r.json()).then(s => {
+                    const spBtn = document.getElementById('stopProfitToggleBtn');
+                    if (spBtn) {
+                        spBtn.textContent = s.stop_profit_enabled ? 'ON' : 'OFF';
+                        spBtn.style.background = s.stop_profit_enabled ? '#10b981' : 'var(--bg-tertiary)';
+                        spBtn.style.color = s.stop_profit_enabled ? '#fff' : 'var(--text-secondary)';
+                    }
+                    if (document.activeElement !== document.getElementById('stopProfitInput')) {
+                        document.getElementById('stopProfitInput').value = (s.stop_profit_target || 2.5).toFixed(2);
+                    }
+                    const schBtn = document.getElementById('schedulerToggleBtn');
+                    if (schBtn) {
+                        schBtn.textContent = s.scheduler_enabled ? 'ON' : 'OFF';
+                        schBtn.style.background = s.scheduler_enabled ? '#10b981' : 'var(--bg-tertiary)';
+                        schBtn.style.color = s.scheduler_enabled ? '#fff' : 'var(--text-secondary)';
+                    }
+                });
+            }
+
+            window.updateCapital = function () {
+                const val = parseFloat(document.getElementById('capitalInput').value);
+                if (!val || val <= 0) {
+                    toast('Please enter a valid bet amount', 'error');
+                    return;
+                }
+                if (val > 100.00) {
+                    toast('Max bet amount is $100.00 (safety limit)', 'error');
+                    return;
+                }
+                if (!confirm(`Set bet amount to $${val.toFixed(2)} per trade?`)) return;
+
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ capital: val })
+                })
+                    .then(r => r.json())
+                    .then(() => {
+                        toast(`Bet amount updated to $${val.toFixed(2)}`);
+                        refreshAll();
+                    })
+                    .catch(() => toast('Error updating bet amount', 'error'));
+            };
+
+            window.toggleBot = function () {
+                const newState = !botRunning;
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ bot_running: newState })
+                })
+                    .then(r => r.json())
+                    .then(() => {
+                        toast(newState ? 'Bot resumed' : 'Bot paused');
+                        updateLive();
+                    })
+                    .catch(() => toast('Error toggling bot', 'error'));
+            };
+
+            window.triggerKillSwitch = function () {
+                if (!confirm('🛑 KILL SWITCH\n\nThis will:\n• Immediately STOP the bot\n• Cancel ALL pending orders\n\nAre you sure?')) return;
+                fetch('/api/kill-switch', { method: 'POST' })
+                    .then(r => r.json())
+                    .then(() => {
+                        toast('🛑 Kill switch activated — bot stopped', 'error');
+                        updateLive();
+                    })
+                    .catch(() => toast('Error activating kill switch', 'error'));
+            };
+
+            // Wallet info polling
+            function updateWallet() {
+                fetch('/api/wallet')
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.mode !== 'paper' && data.balance !== null) {
+                            document.getElementById('walletBalance').textContent = '$' + parseFloat(data.balance).toFixed(4);
+                            document.getElementById('walletFunder').textContent = data.funder || '—';
+                        }
+                    })
+                    .catch(() => {});
+            }
+            setInterval(updateWallet, 30000); // refresh every 30s
+            updateWallet(); // initial load
+
+            // ─── Trading Mode Toggle ────────────────────────────────────────────
+            window.setTradingMode = function (mode) {
+                const label = mode === 'real' ? '🔴 REAL TRADING (uang asli!)' : '👻 Shadow (log only)';
+                if (mode === 'real') {
+                    if (!confirm(`⚠️ Switch ke ${label}?\n\nBot akan menggunakan UANG ASLI untuk trading!`)) return;
+                }
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ trading_mode: mode })
+                })
+                    .then(r => r.json())
+                    .then(() => {
+                        toast(`Trading mode: ${label}`);
+                        updateLive();
+                    })
+                    .catch(() => toast('Error switching mode', 'error'));
+            };
+
+            function updateModeButtons(mode) {
+                const shadowBtn = document.getElementById('modeShadowBtn');
+                const realBtn = document.getElementById('modeRealBtn');
+                if (mode === 'real') {
+                    realBtn.style.background = '#dc2626';
+                    realBtn.style.color = '#fff';
+                    realBtn.style.borderColor = '#dc2626';
+                    shadowBtn.style.background = '';
+                    shadowBtn.style.color = '';
+                    shadowBtn.style.borderColor = '';
+                } else {
+                    shadowBtn.style.background = '#7c3aed';
+                    shadowBtn.style.color = '#fff';
+                    shadowBtn.style.borderColor = '#7c3aed';
+                    realBtn.style.background = '';
+                    realBtn.style.color = '';
+                    realBtn.style.borderColor = '';
+                }
+            }
+
+            // ─── Reset History ───────────────────────────────────────────────────
+            window.resetHistory = function () {
+                if (!confirm('🗑️ RESET ALL HISTORY\n\nThis will permanently delete:\n• All trade records\n• All skipped events\n\nAre you sure?')) return;
+                if (!confirm('⚠️ FINAL CONFIRMATION\n\nType OK below to confirm deletion.')) return;
+                fetch('/api/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: 'RESET' })
+                })
+                    .then(r => r.json())
+                    .then(() => {
+                        toast('🗑️ All history cleared');
+                        refreshAll();
+                    })
+                    .catch(() => toast('Error resetting', 'error'));
+            };
+
+            // ─── Projection ─────────────────────────────────────────────────────
+            window.calcProjection = function () {
+                const capital = parseFloat(document.getElementById('projCapital').value);
+                if (!capital || capital <= 0) {
+                    toast('Enter a valid capital amount', 'error');
+                    return;
+                }
+
+                fetch(`/api/projection?capital=${capital}`)
+                    .then(r => r.json())
+                    .then(d => {
+                        document.getElementById('projPnl').textContent = fmt$(d.projected_pnl);
+                        document.getElementById('projPnl').className = 'projection-value ' + pnlClass(d.projected_pnl);
+
+                        document.getElementById('projBalance').textContent = '$' + d.projected_balance.toFixed(4);
+                        document.getElementById('projROI').textContent = d.projected_roi.toFixed(2) + '%';
+                        document.getElementById('projROI').className = 'projection-value ' + pnlClass(d.projected_roi);
+
+                        document.getElementById('projWinRate').textContent = d.win_rate.toFixed(1) + '%';
+                        document.getElementById('projAvgReturn').textContent = d.avg_return_pct.toFixed(2) + '%';
+
+                        document.getElementById('projDaily').textContent = fmt$(d.projected_daily_pnl);
+                        document.getElementById('projDaily').className = 'projection-value ' + pnlClass(d.projected_daily_pnl);
+
+                        document.getElementById('projWeekly').textContent = fmt$(d.projected_weekly_pnl);
+                        document.getElementById('projWeekly').className = 'projection-value ' + pnlClass(d.projected_weekly_pnl);
+
+                        document.getElementById('projMonthly').textContent = fmt$(d.projected_monthly_pnl);
+                        document.getElementById('projMonthly').className = 'projection-value ' + pnlClass(d.projected_monthly_pnl);
+                    })
+                    .catch(() => toast('Error calculating projection', 'error'));
+            };
+
+            function historyFilters() {
+                const from = document.getElementById('historyDateFrom')?.value || '';
+                const to = document.getElementById('historyDateTo')?.value || '';
+                const result = document.getElementById('historyResult')?.value || '';
+                const side = document.getElementById('historySide')?.value || '';
+                const reason = document.getElementById('historyReason')?.value || '';
+                return { from, to, result, side, reason };
+            }
+
+            window.applyHistoryFilters = function () {
+                historyTradePage = 1;
+                historySkippedPage = 1;
+                refreshHistory();
+            };
+
+            window.resetHistoryFilters = function () {
+                document.getElementById('historyDateFrom').value = '';
+                document.getElementById('historyDateTo').value = '';
+                document.getElementById('historyResult').value = '';
+                document.getElementById('historySide').value = '';
+                document.getElementById('historyReason').value = '';
+                historyTradePage = 1;
+                historySkippedPage = 1;
+                refreshHistory();
+            };
+
+            window.changeHistoryTradePage = function(delta) {
+                const newPage = historyTradePage + delta;
+                if (newPage >= 1) {
+                    historyTradePage = newPage;
+                    updateHistoryTrades();
+                }
+            };
+
+            window.changeHistorySkippedPage = function(delta) {
+                const newPage = historySkippedPage + delta;
+                if (newPage >= 1) {
+                    historySkippedPage = newPage;
+                    updateHistorySkipped();
+                }
+            };
+
+            function refreshHistory() {
+                if (historyTab === 'trades') updateHistoryTrades();
+                else updateHistorySkipped();
+            }
+
+            function updateHistoryTrades() {
+                const f = historyFilters();
+                const limit = parseInt(document.getElementById('historyTradeLimit')?.value || '20', 10);
+                const offset = (historyTradePage - 1) * limit;
+                const qs = new URLSearchParams({
+                    scope: 'all',
+                    limit: limit,
+                    offset: offset
+                });
+                if (f.from) qs.set('from', f.from);
+                if (f.to) qs.set('to', f.to);
+                if (f.result) qs.set('result', f.result);
+                if (f.side) qs.set('side', f.side);
+
+                fetch('/api/trades?' + qs.toString())
+                    .then(r => r.json())
+                    .then(trades => {
+                        const lbl = document.getElementById('historyTradePageLabel');
+                        if (lbl) lbl.textContent = 'Page ' + historyTradePage;
+                        const tbody = document.getElementById('historyTradeTableBody');
+                        const empty = document.getElementById('emptyHistoryTrades');
+                        const wrap = document.getElementById('historyTradeTableWrapper');
+                        if (!trades.length) {
+                            tbody.innerHTML = '';
+                            empty.style.display = '';
+                            wrap.style.display = 'none';
+                            return;
+                        }
+                        empty.style.display = 'none';
+                        wrap.style.display = '';
+                        tbody.innerHTML = trades.map(t => {
+                            let resultBadge = '';
+                            if (t.result === 'WIN') resultBadge = '<span class="badge badge-win">WIN</span>';
+                            else if (t.result === 'LOSS') resultBadge = '<span class="badge badge-loss">LOSS</span>';
+                            else if (t.result === 'PENDING') resultBadge = '<span class="badge badge-pending">PENDING</span>';
+                            else resultBadge = `<span class="badge" style="background:var(--bg-secondary); color:var(--text-secondary)">${t.result}</span>`;
+                            const sideBadge = t.side === 'UP'
+                                ? '<span class="badge badge-up">▲ UP</span>'
+                                : '<span class="badge badge-down">▼ DOWN</span>';
+                            const pnlStr = t.result === 'PENDING' ? '—' : fmt$(t.pnl);
+                            const pnlCls = t.result === 'PENDING' ? '' : pnlClass(t.pnl);
+                            const question = t.market_question || '';
+                            const dashIdx = question.indexOf(' - ');
+                            const eventTime = dashIdx !== -1 ? question.substring(dashIdx + 3) : (t.market_slug || '—');
+                            
+                            let cdStr = '—';
+                            if (t.end_time && t.end_time > 0 && t.timestamp) {
+                                let tsIso = t.timestamp;
+                                if (!tsIso.endsWith('Z')) tsIso += 'Z';
+                                const tsSec = new Date(tsIso).getTime() / 1000;
+                                const cd = t.end_time - tsSec;
+                                const m = Math.floor(Math.abs(cd) / 60);
+                                const s = Math.floor(Math.abs(cd) % 60);
+                                cdStr = (cd < 0 ? '-' : '') + m + ':' + String(s).padStart(2, '0');
+                            }
+
+                            return `<tr>
+                        <td>${t.id}</td>
+                        <td>${fmtTime(t.timestamp)}</td>
+                        <td title="${question}">${eventTime}</td>
+                        <td>${sideBadge}</td>
+                        <td>${fmtCents(t.entry_price)}</td>
+                        <td>$${parseFloat(t.bet_amount).toFixed(4)}</td>
+                        <td>${parseFloat(t.shares).toFixed(4)}</td>
+                        <td>${cdStr}</td>
+                        <td>${resultBadge}</td>
+                        <td class="${pnlCls}">${pnlStr}</td>
+                        <td>$${parseFloat(t.balance_after).toFixed(4)}</td>
+                    </tr>`;
+                        }).join('');
+                    })
+                    .catch(() => { });
+            }
+
+            function updateHistorySkipped() {
+                const f = historyFilters();
+                const limit = parseInt(document.getElementById('historySkippedLimit')?.value || '20', 10);
+                const offset = (historySkippedPage - 1) * limit;
+                const qs = new URLSearchParams({
+                    scope: 'all',
+                    limit: limit,
+                    offset: offset
+                });
+                if (f.from) qs.set('from', f.from);
+                if (f.to) qs.set('to', f.to);
+                if (f.reason) qs.set('reason', f.reason);
+
+                fetch('/api/skipped?' + qs.toString())
+                    .then(r => r.json())
+                    .then(events => {
+                        const lbl = document.getElementById('historySkippedPageLabel');
+                        if (lbl) lbl.textContent = 'Page ' + historySkippedPage;
+                        const tbody = document.getElementById('historySkippedTableBody');
+                        const empty = document.getElementById('emptyHistorySkipped');
+                        const wrap = document.getElementById('historySkippedTableWrapper');
+                        if (!events.length) {
+                            tbody.innerHTML = '';
+                            empty.style.display = '';
+                            wrap.style.display = 'none';
+                            return;
+                        }
+                        empty.style.display = 'none';
+                        wrap.style.display = '';
+                        tbody.innerHTML = events.map(e => {
+                            const question = e.market_question || '';
+                            const dashIdx = question.indexOf(' - ');
+                            const eventTime = dashIdx !== -1 ? question.substring(dashIdx + 3) : (e.market_slug || '—');
+                            let reasonBadge = '';
+                            if (e.reason.includes('price_out_of_range')) {
+                                reasonBadge = '<span class="badge badge-loss">Price</span>';
+                            } else if (e.reason.includes('countdown_too_early')) {
+                                reasonBadge = '<span class="badge badge-pending">Too Early</span>';
+                            } else if (e.reason.includes('countdown_too_late')) {
+                                reasonBadge = '<span class="badge badge-pending">Too Late</span>';
+                            } else {
+                                reasonBadge = '<span class="badge">' + e.reason + '</span>';
+                            }
+                            const cd = e.countdown;
+                            let cdStr = '—';
+                            if (cd !== null && cd !== undefined) {
+                                const m = Math.floor(Math.abs(cd) / 60);
+                                const s = Math.floor(Math.abs(cd) % 60);
+                                cdStr = m + ':' + String(s).padStart(2, '0');
+                            }
+                            return `<tr>
+                        <td>${e.id}</td>
+                        <td>${fmtTime(e.timestamp)}</td>
+                        <td title="${question}">${eventTime}</td>
+                        <td title="${e.reason}">${reasonBadge}</td>
+                        <td>${e.up_price !== null ? fmtCents(e.up_price) : '—'}</td>
+                        <td>${e.down_price !== null ? fmtCents(e.down_price) : '—'}</td>
+                        <td>${cdStr}</td>
+                    </tr>`;
+                        }).join('');
+                    })
+                    .catch(() => { });
+            }
+
+            function projectionFilters() {
+                const clampDate = (v) => {
+                    if (!v) return '';
+                    if (v < '2026-04-01') return '2026-04-01';
+                    if (v > '2099-12-31') return '2099-12-31';
+                    return v;
+                };
+                const fromEl = document.getElementById('projectionDateFrom');
+                const toEl = document.getElementById('projectionDateTo');
+                const fromVal = clampDate(fromEl?.value || '');
+                const toVal = clampDate(toEl?.value || '');
+                if (fromEl && fromEl.value !== fromVal) fromEl.value = fromVal;
+                if (toEl && toEl.value !== toVal) toEl.value = toVal;
+                return {
+                    period: document.getElementById('projectionPeriod')?.value || 'today',
+                    from: fromVal,
+                    to: toVal
+                };
+            }
+
+            function drawProjectionChart() {
+                const canvas = document.getElementById('projectionChartCanvas');
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return;
+                const { w, h } = setCanvasSize(canvas);
+                ctx.clearRect(0, 0, w, h);
+
+                const series = projectionData.series || [];
+                const totals = projectionData.totals || { win_amount: 0, loss_amount: 0, net_amount: 0 };
+                const pad = { l: 48, r: 14, t: 14, b: 28 };
+                const innerW = w - pad.l - pad.r;
+                const innerH = h - pad.t - pad.b;
+
+                if (!series.length) {
+                    ctx.fillStyle = 'rgba(148,163,184,0.8)';
+                    ctx.font = '12px var(--font-mono)';
+                    ctx.fillText('No data in selected range', pad.l, pad.t + 20);
+                    return;
+                }
+
+                if (projectionChartType === 'pie') {
+                    const total = Math.max(0.000001, totals.win_amount + totals.loss_amount);
+                    const cx = pad.l + innerW / 2;
+                    const cy = pad.t + innerH / 2;
+                    const r = Math.min(innerW, innerH) * 0.44;
+                    const winAngle = (totals.win_amount / total) * Math.PI * 2;
+                    const lossAngle = (totals.loss_amount / total) * Math.PI * 2;
+
+                    ctx.beginPath();
+                    ctx.moveTo(cx, cy);
+                    ctx.fillStyle = 'rgba(16,185,129,0.9)';
+                    ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + winAngle);
+                    ctx.closePath();
+                    ctx.fill();
+
+                    ctx.beginPath();
+                    ctx.moveTo(cx, cy);
+                    ctx.fillStyle = 'rgba(239,68,68,0.9)';
+                    ctx.arc(cx, cy, r, -Math.PI / 2 + winAngle, -Math.PI / 2 + winAngle + lossAngle);
+                    ctx.closePath();
+                    ctx.fill();
+
+                    ctx.fillStyle = 'rgba(148,163,184,0.95)';
+                    ctx.font = '12px var(--font-mono)';
+                    ctx.textAlign = 'left';
+                    ctx.fillText(`WIN: $${totals.win_amount.toFixed(4)}`, pad.l, h - 14);
+                    ctx.textAlign = 'right';
+                    ctx.fillText(`LOSS: $${totals.loss_amount.toFixed(4)}`, w - pad.r, h - 14);
+
+                    if (projectionHoverIdx >= 0) {
+                        const isWin = projectionHoverIdx === 0;
+                        const val = isWin ? totals.win_amount : totals.loss_amount;
+                        const pct = (val / total) * 100;
+                        const txt = `${isWin ? 'WIN' : 'LOSS'} $${val.toFixed(4)} (${pct.toFixed(1)}%)`;
+                        const tw = ctx.measureText(txt).width + 16;
+                        const tx = cx - tw / 2;
+                        const ty = cy - r - 28;
+                        ctx.fillStyle = 'rgba(15,23,42,0.92)';
+                        ctx.fillRect(tx, ty, tw, 22);
+                        ctx.strokeStyle = 'rgba(99,102,241,0.55)';
+                        ctx.strokeRect(tx, ty, tw, 22);
+                        ctx.fillStyle = 'rgba(241,245,249,0.95)';
+                        ctx.textAlign = 'left';
+                        ctx.fillText(txt, tx + 8, ty + 15);
+                    }
+                    return;
+                }
+
+                const wins = series.map(x => x.win_amount || 0);
+                const losses = series.map(x => x.loss_amount || 0);
+                let maxY = Math.max(...wins, ...losses, 1);
+                maxY *= 1.1;
+                const xFor = (i) => pad.l + (innerW * i) / Math.max(1, (series.length - 1));
+                const yFor = (v) => pad.t + innerH * (1 - v / maxY);
+
+                ctx.strokeStyle = 'rgba(148,163,184,0.18)';
+                ctx.lineWidth = 1;
+                for (let i = 0; i <= 4; i++) {
+                    const y = pad.t + (innerH * i) / 4;
+                    const val = maxY * (1 - i / 4);
+                    ctx.beginPath();
+                    ctx.moveTo(pad.l, y);
+                    ctx.lineTo(pad.l + innerW, y);
+                    ctx.stroke();
+                    ctx.fillStyle = 'rgba(148,163,184,0.9)';
+                    ctx.font = '11px var(--font-mono)';
+                    ctx.textAlign = 'right';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText('$' + val.toFixed(2), pad.l - 6, y);
+                }
+
+                function drawSeries(values, color) {
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    values.forEach((v, i) => {
+                        const x = xFor(i);
+                        const y = yFor(v);
+                        if (i === 0) ctx.moveTo(x, y);
+                        else ctx.lineTo(x, y);
+                    });
+                    ctx.stroke();
+                }
+
+                drawSeries(wins, 'rgba(16,185,129,0.95)');
+                drawSeries(losses, 'rgba(239,68,68,0.95)');
+
+                if (projectionHoverIdx >= 0 && projectionHoverIdx < series.length) {
+                    const p = series[projectionHoverIdx];
+                    const x = xFor(projectionHoverIdx);
+                    const yw = yFor(p.win_amount || 0);
+                    const yl = yFor(p.loss_amount || 0);
+                    ctx.strokeStyle = 'rgba(148,163,184,0.45)';
+                    ctx.beginPath();
+                    ctx.moveTo(x, pad.t);
+                    ctx.lineTo(x, pad.t + innerH);
+                    ctx.stroke();
+                    ctx.fillStyle = 'rgba(16,185,129,1)';
+                    ctx.beginPath();
+                    ctx.arc(x, yw, 3.8, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.fillStyle = 'rgba(239,68,68,1)';
+                    ctx.beginPath();
+                    ctx.arc(x, yl, 3.8, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    const tip1 = p.label;
+                    const tip2 = `W:$${(p.win_amount || 0).toFixed(4)} L:$${(p.loss_amount || 0).toFixed(4)}`;
+                    ctx.fillStyle = 'rgba(15,23,42,0.92)';
+                    ctx.font = '11px var(--font-mono)';
+                    const tw = Math.max(ctx.measureText(tip1).width, ctx.measureText(tip2).width) + 16;
+                    const tx = Math.min(Math.max(x - tw / 2, pad.l), pad.l + innerW - tw);
+                    const ty = pad.t + 6;
+                    ctx.fillRect(tx, ty, tw, 34);
+                    ctx.strokeStyle = 'rgba(99,102,241,0.55)';
+                    ctx.strokeRect(tx, ty, tw, 34);
+                    ctx.fillStyle = 'rgba(241,245,249,0.95)';
+                    ctx.textAlign = 'left';
+                    ctx.textBaseline = 'top';
+                    ctx.fillText(tip1, tx + 8, ty + 5);
+                    ctx.fillText(tip2, tx + 8, ty + 18);
+                }
+            }
+
+            function updateProjectionSummary() {
+                const t = projectionData.totals || {};
+                const win = Number(t.win_amount || 0);
+                const loss = Number(t.loss_amount || 0);
+                const net = Number(t.net_amount || 0);
+                document.getElementById('projChartWin').textContent = '$' + win.toFixed(4);
+                document.getElementById('projChartLoss').textContent = '$' + loss.toFixed(4);
+                const netEl = document.getElementById('projChartNet');
+                netEl.textContent = (net >= 0 ? '+$' : '-$') + Math.abs(net).toFixed(4);
+                netEl.className = 'stat-value ' + (net > 0 ? 'positive' : net < 0 ? 'negative' : 'neutral');
+                document.getElementById('projectionRangeBadge').textContent =
+                    `${projectionData.date_from || '—'} → ${projectionData.date_to || '—'}`;
+            }
+
+            function refreshProjection() {
+                const f = projectionFilters();
+                const qs = new URLSearchParams({ period: f.period });
+                if (f.from) qs.set('from', f.from);
+                if (f.to) qs.set('to', f.to);
+                fetch('/api/projection/charts?' + qs.toString())
+                    .then(r => r.json())
+                    .then(data => {
+                        projectionData = data || { series: [], totals: { win_amount: 0, loss_amount: 0, net_amount: 0 } };
+                        projectionHoverIdx = -1;
+                        updateProjectionSummary();
+                        drawProjectionChart();
+                    })
+                    .catch(() => { });
+            }
+
+            window.switchProjectionChart = function (type) {
+                projectionChartType = type === 'pie' ? 'pie' : 'line';
+                document.getElementById('projectionToggleLine').classList.toggle('active', projectionChartType === 'line');
+                document.getElementById('projectionTogglePie').classList.toggle('active', projectionChartType === 'pie');
+                projectionHoverIdx = -1;
+                drawProjectionChart();
+            };
+
+            window.applyProjectionFilters = function () {
+                refreshProjection();
+            };
+
+            window.resetProjectionFilters = function () {
+                document.getElementById('projectionPeriod').value = 'today';
+                document.getElementById('projectionDateFrom').value = '';
+                document.getElementById('projectionDateTo').value = '';
+                refreshProjection();
+            };
+
+            function updateProjectionHover(evt) {
+                const canvas = document.getElementById('projectionChartCanvas');
+                if (!canvas) return;
+                const rect = canvas.getBoundingClientRect();
+                const x = evt.clientX - rect.left;
+                const y = evt.clientY - rect.top;
+                if (projectionChartType === 'pie') {
+                    const pad = { l: 48, r: 14, t: 14, b: 28 };
+                    const innerW = rect.width - pad.l - pad.r;
+                    const innerH = rect.height - pad.t - pad.b;
+                    const cx = pad.l + innerW / 2;
+                    const cy = pad.t + innerH / 2;
+                    const r = Math.min(innerW, innerH) * 0.44;
+                    const dx = x - cx;
+                    const dy = y - cy;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist > r) {
+                        if (projectionHoverIdx !== -1) {
+                            projectionHoverIdx = -1;
+                            drawProjectionChart();
+                        }
+                        return;
+                    }
+                    const totals = projectionData.totals || { win_amount: 0, loss_amount: 0 };
+                    const total = Math.max(0.000001, totals.win_amount + totals.loss_amount);
+                    const winAngle = (totals.win_amount / total) * Math.PI * 2;
+                    let ang = Math.atan2(dy, dx) + Math.PI / 2;
+                    if (ang < 0) ang += Math.PI * 2;
+                    const idx = ang <= winAngle ? 0 : 1;
+                    if (idx !== projectionHoverIdx) {
+                        projectionHoverIdx = idx;
+                        drawProjectionChart();
+                    }
+                    return;
+                }
+
+                const series = projectionData.series || [];
+                if (!series.length) return;
+                const pad = { l: 48, r: 14 };
+                const innerW = rect.width - pad.l - pad.r;
+                if (innerW <= 0 || x < pad.l || x > pad.l + innerW) {
+                    if (projectionHoverIdx !== -1) {
+                        projectionHoverIdx = -1;
+                        drawProjectionChart();
+                    }
+                    return;
+                }
+                const idx = Math.round(((x - pad.l) / innerW) * Math.max(1, series.length - 1));
+                if (idx !== projectionHoverIdx) {
+                    projectionHoverIdx = idx;
+                    drawProjectionChart();
+                }
+            }
+
+            // ─── Auto Refresh ───────────────────────────────────────────────────
+            function refreshAll() {
+                updateStats();
+                updateBalanceChart();
+                updateLive();
+                updateTrades();
+                updateSkipped();
+                syncFeatureToggles();
+                if (activeView === 'history') refreshHistory();
+                if (activeView === 'projection') refreshProjection();
+            }
+
+            // Initial load
+            refreshAll();
+
+            // Load settings
+            fetch('/api/settings')
+                .then(r => r.json())
+                .then(s => {
+                    document.getElementById('capitalInput').value = s.capital;
+                    if (s.theme && s.theme !== currentTheme) {
+                        currentTheme = s.theme;
+                        document.documentElement.setAttribute('data-theme', currentTheme);
+                        localStorage.setItem('polybots-theme', currentTheme);
+                        updateThemeIcon();
+                    }
+                })
+                .catch(() => { });
+
+            // Auto-refresh intervals
+            setInterval(updateLive, 3000);      // Live data every 3s
+            setInterval(updateStats, 5000);      // Stats every 5s
+            setInterval(updateBalanceChart, 15000); // Balance chart every 15s
+            setInterval(updateTrades, 10000);    // Trades every 10s
+            setInterval(updateSkipped, 15000);   // Skipped every 15s
+            setInterval(() => {
+                if (activeView === 'projection') refreshProjection();
+            }, 20000);
+
+            window.addEventListener('resize', () => {
+                drawBalanceChart();
+            });
+            document.addEventListener('DOMContentLoaded', () => {
+                const canvas = document.getElementById('balanceChart');
+                if (canvas) {
+                    canvas.addEventListener('mousemove', updateBalanceChartHover);
+                    canvas.addEventListener('mouseleave', () => {
+                        balanceChartHoverIdx = -1;
+                        drawBalanceChart();
+                    });
+                }
+                const pCanvas = document.getElementById('projectionChartCanvas');
+                if (pCanvas) {
+                    pCanvas.addEventListener('mousemove', updateProjectionHover);
+                    pCanvas.addEventListener('mouseleave', () => {
+                        projectionHoverIdx = -1;
+                        drawProjectionChart();
+                    });
+                }
+            });
+
+            // ─── Update Skipped Events ──────────────────────────────────────────
+            function updateSkipped() {
+                fetch('/api/skipped?scope=today_utc&limit=500')
+                    .then(r => r.json())
+                    .then(events => {
+                        const badge = document.getElementById('skippedBadge');
+                        const skipBadge = document.getElementById('skipCount');
+                        badge.textContent = events.length + ' events';
+                        skipBadge.textContent = events.length + ' skipped';
+
+                        if (events.length === 0) {
+                            document.getElementById('emptySkipped').style.display = '';
+                            document.getElementById('skippedTableWrapper').style.display = 'none';
+                            return;
+                        }
+
+                        document.getElementById('emptySkipped').style.display = 'none';
+                        document.getElementById('skippedTableWrapper').style.display = '';
+
+                        const tbody = document.getElementById('skippedTableBody');
+                        tbody.innerHTML = events.map(e => {
+                            const question = e.market_question || '';
+                            const dashIdx = question.indexOf(' - ');
+                            const eventTime = dashIdx !== -1 ? question.substring(dashIdx + 3) : (e.market_slug || '—');
+
+                            // Format reason as badge
+                            let reasonBadge = '';
+                            if (e.reason.includes('price_out_of_range')) {
+                                reasonBadge = '<span class="badge badge-loss">Price</span>';
+                            } else if (e.reason.includes('countdown_too_early')) {
+                                reasonBadge = '<span class="badge badge-pending">Too Early</span>';
+                            } else if (e.reason.includes('countdown_too_late')) {
+                                reasonBadge = '<span class="badge badge-pending">Too Late</span>';
+                            } else {
+                                reasonBadge = '<span class="badge">' + e.reason + '</span>';
+                            }
+
+                            const cd = e.countdown;
+                            let cdStr = '—';
+                            if (cd !== null && cd !== undefined) {
+                                const m = Math.floor(Math.abs(cd) / 60);
+                                const s = Math.floor(Math.abs(cd) % 60);
+                                cdStr = m + ':' + String(s).padStart(2, '0');
+                            }
+
+                            return `<tr>
+                        <td>${e.id}</td>
+                        <td>${fmtTime(e.timestamp)}</td>
+                        <td title="${question}">${eventTime}</td>
+                        <td title="${e.reason}">${reasonBadge}</td>
+                        <td>${e.up_price !== null ? fmtCents(e.up_price) : '—'}</td>
+                        <td>${e.down_price !== null ? fmtCents(e.down_price) : '—'}</td>
+                        <td>${cdStr}</td>
+                    </tr>`;
+                        }).join('');
+                    })
+                    .catch(() => { });
+            }
+
+        })();
+    </script>
+
+</body>
+
+</html>

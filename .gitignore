@@ -1,0 +1,16 @@
+# Environment secrets — NEVER commit this
+.env
+
+# Python cache
+*.pyc
+__pycache__/
+
+# Database
+polybots.db
+
+# Debug logs
+debug-*.log
+
+# IDE
+.cursor/
+.vscode/

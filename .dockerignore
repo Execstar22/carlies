@@ -1,0 +1,29 @@
+# Environment secrets — NEVER include in image
+.env
+
+# Python cache
+*.pyc
+__pycache__/
+
+# Database (mounted separately via Docker volume)
+polybots.db
+
+# Debug logs
+debug-*.log
+
+# IDE / Editor
+.cursor/
+.vscode/
+.git/
+.gitignore
+
+# Scratch/utility scripts (not needed in production)
+_*.py
+calc_*.py
+check_*.py
+diagnose_*.py
+enable_*.py
+inject_*.py
+print_*.py
+scratch.py
+test_*.py
