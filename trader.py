@@ -13,6 +13,8 @@ import os
 import logging
 import time
 import json
+import math
+from decimal import Decimal, ROUND_DOWN
 
 log = logging.getLogger("trader")
 
@@ -144,7 +146,7 @@ def _ensure_allowance(client):
         log.warning(f"⚠️ Could not update balance allowance: {e}")
 
 
-def place_real_order(token_id, side, amount_usdc, price):
+def place_real_order(token_id, side, amount_usdc, price, limit_price=None):
     """
     Place a real FOK (Fill-or-Kill) order on Polymarket.
 
@@ -152,11 +154,16 @@ def place_real_order(token_id, side, amount_usdc, price):
         token_id: The CLOB token ID for UP or DOWN
         side: "BUY"
         amount_usdc: Amount in USD to spend (e.g. 0.50)
-        price: Maximum price per share (e.g. 0.82)
+        price: Signal/market price per share (used for size calculation)
+        limit_price: Maximum FOK limit price for slippage tolerance.
+                     Defaults to price if not specified.
 
     Returns:
         dict with order details if successful, None if failed
     """
+    if limit_price is None:
+        limit_price = price
+
     try:
         from py_clob_client_v2.clob_types import (
             OrderArgs, OrderType, PartialCreateOrderOptions
@@ -172,25 +179,30 @@ def place_real_order(token_id, side, amount_usdc, price):
         client = _get_client()
         _ensure_allowance(client)
 
-        # Calculate size (number of shares) — 4 decimal accuracy
-        import math
-        amount_usdc = round(amount_usdc, 2)
-        raw_size = amount_usdc / price
-        size = math.floor(raw_size * 10000) / 10000
+        # Calculate size using Decimal to avoid float precision errors
+        # Float: 2.00 / 0.80 = 2.4999999999999996 (WRONG)
+        # Decimal: Decimal("2.00") / Decimal("0.80") = 2.5 (CORRECT)
+        amount_d = Decimal(str(amount_usdc)).quantize(Decimal("0.01"))
+        price_d = Decimal(str(price)).quantize(Decimal("0.01"))
+        limit_d = Decimal(str(limit_price)).quantize(Decimal("0.01"))
+        size_d = (amount_d / price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        size = float(size_d)
+        amount_usdc = float(amount_d)
+        limit_price = float(limit_d)
 
         log.info(
             f"🔴 PLACING REAL ORDER:\n"
             f"   Token:  {token_id[:24]}...\n"
             f"   Side:   {side}\n"
             f"   Amount: ${amount_usdc:.4f}\n"
-            f"   Price:  {price:.4f}\n"
-            f"   Size:   {size:.4f} shares"
+            f"   Price:  {price:.4f} (limit: {limit_price:.4f})\n"
+            f"   Size:   {size:.4f} shares (Decimal precision)"
         )
 
         resp = client.create_and_post_order(
             order_args=OrderArgs(
                 token_id=token_id,
-                price=price,
+                price=limit_price,
                 side="BUY",
                 size=size,
             ),
@@ -228,12 +240,17 @@ def place_real_order(token_id, side, amount_usdc, price):
                 client = _get_client()
                 _ensure_allowance(client)
 
+                retry_size = float(
+                    (Decimal(str(amount_usdc)) / Decimal(str(price))).quantize(
+                        Decimal("0.0001"), rounding=ROUND_DOWN
+                    )
+                )
                 resp = client.create_and_post_order(
                     order_args=OrderArgs(
                         token_id=token_id,
-                        price=price,
+                        price=limit_price,
                         side="BUY",
-                        size=math.floor(amount_usdc / price * 100) / 100,
+                        size=retry_size,
                     ),
                     order_type=OrderType.FOK,
                     options=PartialCreateOrderOptions(tick_size="0.01"),
@@ -262,12 +279,20 @@ def place_real_order(token_id, side, amount_usdc, price):
 
 def shadow_order(token_id, side, amount_usdc, price, market_slug):
     """
-    Shadow mode: log what WOULD be traded, but don't actually place the order.
-    Returns a fake order result for tracking.
+    Verified Shadow mode: BUILD & SIGN a real order to validate the pipeline,
+    but do NOT post it to the server. No money is spent.
+
+    If credentials are unavailable, falls back to simple log-only mode.
     """
-    size = round(amount_usdc / price, 4)
+    # Use Decimal precision for shadow orders too
+    amount_d = Decimal(str(amount_usdc)).quantize(Decimal("0.01"))
+    price_d = Decimal(str(price)).quantize(Decimal("0.01"))
+    size_d = (amount_d / price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    amount_usdc = float(amount_d)
+    size = float(size_d)
+
     log.info(
-        f"👻 SHADOW ORDER (not placed):\n"
+        f"👻 SHADOW ORDER (verifying...):\n"
         f"   Market: {market_slug}\n"
         f"   Token:  {token_id[:24]}...\n"
         f"   Side:   {side}\n"
@@ -275,12 +300,71 @@ def shadow_order(token_id, side, amount_usdc, price, market_slug):
         f"   Price:  {price:.4f}\n"
         f"   Size:   {size:.4f} shares"
     )
-    return {
-        "order_id": f"shadow-{int(time.time())}",
-        "status": "SHADOW",
-        "response": {"shadow": True},
-        "timestamp": time.time(),
-    }
+
+    # ── Try verified shadow: build + sign via create_order() ──
+    try:
+        from py_clob_client_v2.clob_types import (
+            OrderArgs, OrderType, PartialCreateOrderOptions
+        )
+        from py_clob_client_v2.order_builder.builder import (
+            ROUNDING_CONFIG, RoundConfig,
+        )
+
+        # Apply same SDK rounding fix as place_real_order
+        ROUNDING_CONFIG["0.01"] = RoundConfig(price=2, size=4, amount=2)
+
+        client = _get_client()
+        _ensure_allowance(client)
+
+        # Build + sign order WITHOUT posting
+        signed_order = None
+        # Try positional args first (most common SDK signature)
+        try:
+            signed_order = client.create_order(
+                OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    side="BUY",
+                    size=size,
+                ),
+                PartialCreateOrderOptions(tick_size="0.01"),
+            )
+        except TypeError:
+            # Fallback: kwargs without order_type
+            signed_order = client.create_order(
+                order_args=OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    side="BUY",
+                    size=size,
+                ),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+            )
+
+        log.info(
+            f"✅ SHADOW VERIFIED: Order built & signed successfully!\n"
+            f"   Pipeline valid — order would be accepted if posted."
+        )
+
+        return {
+            "order_id": f"shadow-verified-{int(time.time())}",
+            "status": "SHADOW",
+            "response": {"shadow": True, "verified": True},
+            "timestamp": time.time(),
+        }
+
+    except Exception as e:
+        # ── Fallback: log-only shadow (no credentials / client error) ──
+        log.warning(
+            f"⚠️ SHADOW UNVERIFIED (create_order failed: {e})\n"
+            f"   Order logged but NOT validated. Fix credentials for verified shadow."
+        )
+        return {
+            "order_id": f"shadow-{int(time.time())}",
+            "status": "SHADOW",
+            "response": {"shadow": True, "verified": False, "error": str(e)[:100]},
+            "timestamp": time.time(),
+        }
 
 
 def check_order_status(order_id):

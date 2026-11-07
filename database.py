@@ -72,7 +72,11 @@ def init_db():
         "theme": "dark",
         "stop_profit_enabled": "false",
         "stop_profit_target": "2.5",
-        "scheduler_enabled": "false"
+        "scheduler_enabled": "false",
+        "cap_scale_up_enabled": "true",
+        "cap_scale_up_active": "false",
+        "cap_scale_up_amount": "5.0",
+        "cap_scale_up_original_bet": ""
     }
     for key, val in defaults.items():
         c.execute(
@@ -177,11 +181,37 @@ def record_trade(market_slug, market_question, side, entry_price,
     return new_balance
 
 
+def _calc_real_balance(conn):
+    """
+    Calculate real-mode available balance using pure ledger approach.
+    balance = starting_balance + sum(all resolved PnL) - sum(all pending bet_amounts)
+
+    Recalculates from scratch every time to avoid accumulated errors
+    from chaining off previous trades' balance_after values.
+    """
+    starting_row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'real_starting_balance'"
+    ).fetchone()
+    starting_balance = float(starting_row["value"]) if starting_row else 0.0
+
+    resolved_pnl = float(conn.execute(
+        "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+        "WHERE trading_mode='real' AND result != 'PENDING'"
+    ).fetchone()[0])
+
+    pending_bets = float(conn.execute(
+        "SELECT COALESCE(SUM(bet_amount), 0) FROM trades "
+        "WHERE trading_mode='real' AND result = 'PENDING'"
+    ).fetchone()[0])
+
+    return starting_balance + resolved_pnl - pending_bets
+
+
 def record_real_trade(market_slug, market_question, side, entry_price,
                       shares, bet_amount, token_id="", end_time=0,
                       order_id="", order_status="", trading_mode="real",
                       condition_id=""):
-    """Record a real or shadow trade (no local balance deduction)."""
+    """Record a real or shadow trade."""
     conn = get_conn()
     
     balance_after = 0.0
@@ -189,6 +219,19 @@ def record_real_trade(market_slug, market_question, side, entry_price,
         sb = get_shadow_balance()
         balance_after = sb - bet_amount
         update_shadow_balance(balance_after)
+    elif trading_mode == "real":
+        # Anchor-based: stable balance not affected by balance_sync drift.
+        # Shows balance after this bet is placed (money at risk).
+        anchor_row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'real_daily_start_balance'"
+        ).fetchone()
+        anchor = float(anchor_row["value"]) if anchor_row else 0.0
+        today_pnl = float(conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+            "WHERE trading_mode = 'real' AND result IN ('WIN', 'LOSS') "
+            "AND date(datetime(timestamp, '+7 hours')) = date('now', '+7 hours')"
+        ).fetchone()[0])
+        balance_after = anchor + today_pnl - bet_amount
 
     conn.execute("""
         INSERT INTO trades
@@ -220,28 +263,38 @@ def update_trade_order_status(trade_id, new_status):
     conn.close()
 
 
-def get_daily_loss_total():
-    """Calculate total loss for today (WIB) — used for safety limits."""
+def get_daily_loss_total(trading_mode=None):
+    """Calculate total loss for today (WIB) — used for safety limits.
+    Filters by trading_mode to avoid cross-mode contamination."""
+    if trading_mode is None:
+        from config import get_trading_mode
+        trading_mode = get_trading_mode()
     conn = get_conn()
     row = conn.execute("""
         SELECT COALESCE(SUM(ABS(pnl)), 0) as total_loss
         FROM trades
         WHERE result = 'LOSS'
+          AND trading_mode = ?
           AND date(datetime(timestamp, '+7 hours')) = date('now', '+7 hours')
-    """).fetchone()
+    """, (trading_mode,)).fetchone()
     conn.close()
     return float(row["total_loss"]) if row else 0.0
 
 
-def get_daily_profit_total():
-    """Calculate net PnL for today (WIB) — used for stop-profit."""
+def get_daily_profit_total(trading_mode=None):
+    """Calculate net PnL for today (WIB) — used for stop-profit.
+    Filters by trading_mode to avoid cross-mode contamination."""
+    if trading_mode is None:
+        from config import get_trading_mode
+        trading_mode = get_trading_mode()
     conn = get_conn()
     row = conn.execute("""
         SELECT COALESCE(SUM(pnl), 0) as net_pnl
         FROM trades
         WHERE result IN ('WIN', 'LOSS')
+          AND trading_mode = ?
           AND date(datetime(timestamp, '+7 hours')) = date('now', '+7 hours')
-    """).fetchone()
+    """, (trading_mode,)).fetchone()
     conn.close()
     return float(row["net_pnl"]) if row else 0.0
 
@@ -266,34 +319,50 @@ def resolve_trade(trade_id, won):
         payout = 0
         pnl = -trade["bet_amount"]
 
-    # Only adjust local balance for paper trades
+    # Update the live balance setting (used for "can I afford a trade?" checks).
+    # Then compute a *clean* balance_after for the trade record by adding back
+    # bet_amounts of OTHER pending trades, so overlapping pending trades don't
+    # cause a misleading zigzag in the trade-history balance column.
     if trade_mode == "paper":
         balance = get_current_balance()
-        new_balance = balance + payout
-        update_balance(new_balance)
+        live_balance = balance + payout
+        update_balance(live_balance)
+        pending_bets = conn.execute(
+            "SELECT COALESCE(SUM(bet_amount), 0) FROM trades "
+            "WHERE trading_mode = 'paper' AND result = 'PENDING' AND id != ?",
+            (trade_id,)
+        ).fetchone()[0]
+        new_balance = live_balance + float(pending_bets)
     elif trade_mode == "shadow":
         sb = get_shadow_balance()
-        new_balance = sb + payout
-        update_shadow_balance(new_balance)
-    else:
-        # Real trades: balance_after = previous trade's balance_after + pnl
-        # This prevents drift caused by summing all historical PnL from starting_balance
-        last_trade = conn.execute(
-            "SELECT balance_after FROM trades "
-            "WHERE trading_mode='real' AND result != 'PENDING' AND id != ? "
-            "ORDER BY id DESC LIMIT 1",
+        live_balance = sb + payout
+        update_shadow_balance(live_balance)
+        pending_bets = conn.execute(
+            "SELECT COALESCE(SUM(bet_amount), 0) FROM trades "
+            "WHERE trading_mode = 'shadow' AND result = 'PENDING' AND id != ?",
             (trade_id,)
+        ).fetchone()[0]
+        new_balance = live_balance + float(pending_bets)
+    else:
+        # Real trades: anchor-based balance for stable trade history display.
+        # Uses real_daily_start_balance (anchor) + cumulative PnL today (WIB).
+        # This makes balance_after stable — not affected by balance_sync
+        # or on-chain fluctuations that shift real_starting_balance.
+        anchor_row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'real_daily_start_balance'"
         ).fetchone()
-        
-        if last_trade:
-            new_balance = float(last_trade["balance_after"]) + pnl
-        else:
-            # Fallback if this is the first trade
-            starting_row = conn.execute(
-                "SELECT value FROM settings WHERE key = 'real_starting_balance'"
-            ).fetchone()
-            starting_balance = float(starting_row["value"]) if starting_row else 0.0
-            new_balance = starting_balance + pnl
+        anchor = float(anchor_row["value"]) if anchor_row else 0.0
+
+        # Sum all resolved PnL for today (WIB), EXCLUDING the current trade
+        # (it's still PENDING in DB at this point, will be updated below)
+        today_resolved_pnl = float(conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+            "WHERE trading_mode = 'real' AND result IN ('WIN', 'LOSS') "
+            "AND date(datetime(timestamp, '+7 hours')) = date('now', '+7 hours')"
+        ).fetchone()[0])
+
+        # balance_after = anchor + previous resolved PnL + this trade's PnL
+        new_balance = anchor + today_resolved_pnl + pnl
 
     conn.execute("""
         UPDATE trades
@@ -307,6 +376,7 @@ def resolve_trade(trade_id, won):
     ))
     conn.commit()
     conn.close()
+
     return new_balance
 
 
@@ -381,9 +451,32 @@ def get_stats():
         "SELECT COUNT(*) FROM trades WHERE result = 'PENDING'"
     ).fetchone()[0]
 
-    total_pnl = c.execute(
-        "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE result != 'PENDING' AND id >= 284"
-    ).fetchone()[0]
+    # DB PnL: sum of all resolved trades today (WIB).
+    # This is the authoritative source because it knows about WINs immediately
+    # at resolve time, even before USDC is claimed on-chain.
+    db_pnl = float(c.execute(
+        "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+        "WHERE result != 'PENDING' "
+        "AND date(datetime(timestamp, '+7 hours')) = date('now', '+7 hours')"
+    ).fetchone()[0])
+    total_pnl = db_pnl
+
+    try:
+        from config import get_trading_mode
+        if get_trading_mode() == "real":
+            daily_start_row = c.execute("SELECT value FROM settings WHERE key='real_daily_start_balance'").fetchone()
+            if daily_start_row:
+                daily_start = float(daily_start_row["value"])
+                from trader import get_real_balance
+                chain_bal = get_real_balance()
+                if chain_bal is not None:
+                    chain_pnl = chain_bal - daily_start
+                    # Use MAX(on-chain, DB) — same logic as stop profit guard.
+                    # DB detects WINs faster (before USDC claim settles on-chain),
+                    # so we never let on-chain delay understate the real PnL.
+                    total_pnl = max(chain_pnl, db_pnl)
+    except Exception as e:
+        log.warning(f"Failed to fetch on-chain PnL for stats: {e}")
 
     avg_entry = c.execute(
         "SELECT COALESCE(AVG(entry_price), 0) FROM trades"
@@ -598,3 +691,35 @@ def mark_trade_claimed(trade_id, tx_hash=""):
     )
     conn.commit()
     conn.close()
+
+
+def is_slug_already_traded(market_slug):
+    """
+    Database-level guard against double orders.
+    Returns True if a trade already exists for this market slug.
+    This is the last line of defence — even if the in-memory set is lost
+    (e.g. after a container restart), the DB will catch the duplicate.
+    """
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) as cnt FROM trades WHERE market_slug = ?",
+        (market_slug,)
+    ).fetchone()
+    conn.close()
+    return row["cnt"] > 0
+
+
+def get_recent_traded_slugs(hours=1):
+    """
+    Load recently traded market slugs from the database.
+    Used to bootstrap the in-memory traded_slugs set after a restart,
+    preventing double orders on markets that are still active.
+    """
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT market_slug FROM trades "
+        "WHERE timestamp > datetime('now', ? || ' hours')",
+        (f"-{hours}",)
+    ).fetchall()
+    conn.close()
+    return [r["market_slug"] for r in rows]

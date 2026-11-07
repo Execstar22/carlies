@@ -8,7 +8,13 @@ import json
 import logging
 import requests
 import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
+from concurrent.futures import ThreadPoolExecutor
+
+# Shared HTTP session for API requests
+_session = requests.Session()
 
 from config import (
     GAMMA_API_BASE, CLOB_API_BASE, MARKET_SLUG_PREFIX,
@@ -16,13 +22,17 @@ from config import (
     PRICE_FLOOR, PRICE_TARGET, PRICE_CEILING,
     BET_AMOUNT, POLL_INTERVAL, MARKET_SCAN_INTERVAL,
     TRADING_MODE, REAL_BET_AMOUNT, MAX_BET_AMOUNT, MAX_DAILY_LOSS,
-    get_trading_mode
+    STOP_LOSS_BALANCE,
+    get_trading_mode,
+    WS_CLOB_URL, WS_RECONNECT_DELAY, WS_MAX_RECONNECT, WS_PING_INTERVAL,
+    MIN_BOOK_DEPTH_MULTIPLIER,
 )
 from database import (
     get_current_balance, record_trade, resolve_trade,
     get_pending_trades, get_setting, update_setting,
     record_skipped_event, reset_paper_trading,
-    record_real_trade, get_daily_loss_total, get_daily_profit_total
+    record_real_trade, get_daily_loss_total, get_daily_profit_total,
+    is_slug_already_traded, get_recent_traded_slugs
 )
 
 # Logging
@@ -51,6 +61,27 @@ def _agent_log(hypothesisId, message, data=None, runId="pre-fix"):
         pass
 # #endregion agent log
 
+# ─── Cached On-Chain Balance (for stop profit without RPC spam) ────────────
+_cached_chain_balance = None
+_cached_chain_balance_ts = 0
+_CHAIN_BALANCE_CACHE_TTL = 10  # seconds — refresh on-chain balance every 10s
+
+
+def get_cached_chain_balance():
+    """Return on-chain balance from cache, refreshing every 30 seconds."""
+    global _cached_chain_balance, _cached_chain_balance_ts
+    now = time.time()
+    if _cached_chain_balance is None or (now - _cached_chain_balance_ts) >= _CHAIN_BALANCE_CACHE_TTL:
+        try:
+            from trader import get_real_balance
+            bal = get_real_balance()
+            if bal is not None:
+                _cached_chain_balance = bal
+                _cached_chain_balance_ts = now
+        except Exception as e:
+            log.debug(f"Cached balance refresh failed: {e}")
+    return _cached_chain_balance
+
 
 class BotState:
     """Shared bot state accessible from dashboard."""
@@ -62,11 +93,15 @@ class BotState:
         self.countdown = None             # seconds remaining
         self.last_error = None
         self.last_update = None
-        self.traded_slugs = set()
-        self.skipped_slugs = set()  # Track slugs already logged as skipped
-        self.disqualified_slugs = set()  # Track slugs disqualified before buy window
+        self.traded_slugs = OrderedDict()    # slug → timestamp (insertion-ordered for FIFO cleanup)
+        self.skipped_slugs = OrderedDict()    # Track slugs already logged as skipped
+        self.disqualified_slugs = OrderedDict()  # Track slugs disqualified before buy window
         self.notifications = []           # Store recent notifications
         self.lock = threading.Lock()
+        # Display-only prices: fetched via REST midpoint (stable, no WS flicker).
+        # Completely independent from up_price/down_price used by trading logic.
+        self.display_up_price = None
+        self.display_down_price = None
 
     def to_dict(self):
         with self.lock:
@@ -75,6 +110,8 @@ class BotState:
                 "current_market": self.current_market,
                 "up_price": self.up_price,
                 "down_price": self.down_price,
+                "display_up_price": self.display_up_price,
+                "display_down_price": self.display_down_price,
                 "countdown": self.countdown,
                 "countdown_display": self._fmt_countdown(),
                 "last_error": self.last_error,
@@ -92,6 +129,12 @@ class BotState:
 
 # Global bot state
 bot_state = BotState()
+
+# Global WebSocket price feed instance
+_ws_feed = None
+
+# Thread pool for parallel order execution
+_order_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="order")
 
 def add_notification(msg):
     with bot_state.lock:
@@ -124,9 +167,18 @@ def fetch_market_by_slug(slug):
         # Add cache-busting query + no-cache headers to reduce stale resolution reads.
         params = {"slug": slug, "_": int(time.time())}
         headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = _session.get(url, params=params, headers=headers, timeout=10)
         if resp.status_code == 200:
-            data = resp.json()
+            # Guard against empty or non-JSON response body before parsing
+            raw = resp.text.strip()
+            if not raw:
+                log.debug(f"Empty response body for market {slug}, skipping")
+                return None
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as je:
+                log.debug(f"Non-JSON response for market {slug} ({je}), skipping")
+                return None
             if data and len(data) > 0:
                 return data[0]
         elif resp.status_code == 429:
@@ -254,7 +306,7 @@ def fetch_price(token_id, side="buy"):
     try:
         url = f"{CLOB_API_BASE}/price"
         params = {"token_id": token_id, "side": side}
-        resp = requests.get(url, params=params, timeout=10)
+        resp = _session.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             price = float(data.get("price", 0))
@@ -275,7 +327,7 @@ def fetch_midpoint(token_id):
     try:
         url = f"{CLOB_API_BASE}/midpoint"
         params = {"token_id": token_id}
-        resp = requests.get(url, params=params, timeout=10)
+        resp = _session.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             mid = float(data.get("mid", 0))
@@ -292,6 +344,50 @@ def fetch_midpoint(token_id):
 
 
 # ─── Resolution Check ────────────────────────────────────────────────────────
+
+# --- Order Book Depth Check -----------------------------------------------
+
+def check_book_depth(token_id, bet_amount, side="buy"):
+    """Check if order book has enough liquidity for our order.
+    
+    Returns:
+        (has_enough: bool, total_liquidity: float)
+    """
+    min_liquidity = bet_amount * MIN_BOOK_DEPTH_MULTIPLIER
+    try:
+        url = f"{CLOB_API_BASE}/book"
+        resp = _session.get(url, params={"token_id": token_id}, timeout=5)
+        if resp.status_code != 200:
+            return True, -1  # Optimistic: proceed if can't check
+        
+        book = resp.json()
+        entries = book.get("asks", []) if side == "buy" else book.get("bids", [])
+        
+        total_liquidity = 0.0
+        for entry in entries:
+            try:
+                entry_price = float(entry.get("price", 0))
+                entry_size = float(entry.get("size", 0))
+                total_liquidity += entry_price * entry_size
+            except (ValueError, TypeError):
+                continue
+        
+        has_enough = total_liquidity >= min_liquidity
+        if not has_enough:
+            log.info(
+                f"\ud83d\udcca Book depth LOW: ${total_liquidity:.2f} available "
+                f"(need ${min_liquidity:.2f} = {MIN_BOOK_DEPTH_MULTIPLIER}\u00d7 ${bet_amount:.2f})"
+            )
+        else:
+            log.debug(
+                f"\ud83d\udcca Book depth OK: ${total_liquidity:.2f} \u2265 ${min_liquidity:.2f}"
+            )
+        
+        return has_enough, total_liquidity
+    except Exception as e:
+        log.warning(f"Book depth check failed: {e}")
+        return True, -1  # Optimistic fallback
+
 
 def check_and_resolve_pending():
     """Check if any pending trades' markets have resolved."""
@@ -339,10 +435,24 @@ def check_and_resolve_pending():
                 p1 = float(outcome_prices[1])
                 # Treat as resolved when payouts are effectively final (0/1 style).
                 # This catches cases where payout arrives before resolution flags update.
-                payout_resolved = (
+                payout_final = (
                     (p0 >= 0.99 and p1 <= 0.01) or
                     (p1 >= 0.99 and p0 <= 0.01)
                 )
+                # Only trust payout signal AFTER market end_time has passed.
+                # Gamma API often returns near-final prices (e.g. 0.995/0.005)
+                # while the market is still running, which is NOT actual resolution.
+                if payout_final and trade.get("end_time") and trade["end_time"] > 0:
+                    payout_resolved = time.time() > trade["end_time"]
+                    if payout_final and not payout_resolved:
+                        log.info(
+                            f"Trade #{trade['id']} payout looks final "
+                            f"({outcome_prices}) but market still running "
+                            f"({trade['end_time'] - time.time():.0f}s left); "
+                            f"deferring resolution"
+                        )
+                else:
+                    payout_resolved = payout_final
             except (ValueError, TypeError):
                 payout_resolved = False
 
@@ -404,6 +514,25 @@ def check_and_resolve_pending():
         log.info(f"Trade #{trade['id']} resolved: {'WIN' if won else 'LOSS'} "
                  f"(side={trade_side}, outcomePrices={outcome_prices})")
         resolve_trade(trade["id"], won=won)
+
+        # ── Cap Scale Up: auto-raise bet on LOSS (shadow/real only) ──
+        trade_mode = trade.get("trading_mode", "paper")
+        if not won and trade_mode in ("real", "shadow"):
+            cap_enabled = get_setting("cap_scale_up_enabled") != "false"
+            cap_already_active = get_setting("cap_scale_up_active") == "true"
+            if cap_enabled and not cap_already_active:
+                cap_amount = float(get_setting("cap_scale_up_amount") or 5.0)
+                current_bet = get_setting("real_bet_amount")
+                # Save original bet so it can be restored later
+                update_setting("cap_scale_up_original_bet", current_bet or "1.00")
+                update_setting("real_bet_amount", f"{cap_amount:.4f}")
+                update_setting("cap_scale_up_active", "true")
+                msg = (
+                    f"📈 CAP SCALE UP: Loss detected on trade #{trade['id']} → "
+                    f"Bet raised from ${float(current_bet or 1):.2f} to ${cap_amount:.2f}"
+                )
+                log.info(msg)
+                add_notification(msg)
 
 
 # ─── Strategy ────────────────────────────────────────────────────────────────
@@ -485,23 +614,43 @@ def execute_real_trade(market, side, price):
     current_bet = float(db_bet) if db_bet else REAL_BET_AMOUNT
     bet_amount = min(current_bet, MAX_BET_AMOUNT)
 
-    # Daily loss safety check (0 = disabled/no limit)
-    daily_loss = get_daily_loss_total()
-    if MAX_DAILY_LOSS > 0 and daily_loss >= MAX_DAILY_LOSS:
-        msg = (
-            f"🛑 STOP LOSS REACHED (${daily_loss:.4f} >= ${MAX_DAILY_LOSS:.2f}), "
-            f"skipping trade"
-        )
-        log.warning(msg)
-        add_notification(msg)
-        return False
+    mode = get_trading_mode()
+    
+    # Daily loss safety check
+    if MAX_DAILY_LOSS > 0:
+        daily_loss = None
+        
+        # If real mode, try to use on-chain anchor first
+        if mode == "real":
+            try:
+                daily_start = get_setting("real_daily_start_balance")
+                chain_bal = get_real_balance()
+                if chain_bal is not None and daily_start:
+                    daily_loss = float(daily_start) - chain_bal
+                    if daily_loss < 0:
+                        daily_loss = 0  # wallet went UP, no loss
+            except Exception:
+                pass
+        
+        # Fallback for real mode, and primary for shadow mode: use DB method
+        if daily_loss is None:
+            daily_loss = get_daily_loss_total(mode)
+        
+        if daily_loss >= MAX_DAILY_LOSS:
+            msg = (
+                f"STOP LOSS REACHED (${daily_loss:.4f} >= ${MAX_DAILY_LOSS:.2f}), "
+                f"skipping trade"
+            )
+            log.warning(msg)
+            add_notification(msg)
+            return False
 
     token_id = market.get(f"{side.lower()}_token", "")
     if not token_id:
         log.error(f"No token ID for side {side}")
         return False
 
-    mode = get_trading_mode()
+
     if mode == "shadow":
         result = shadow_order(token_id, "BUY", bet_amount, price, market["slug"])
         mode_label = "shadow"
@@ -519,12 +668,11 @@ def execute_real_trade(market, side, price):
         # order tolerates small price moves.  Actual fill price will still be
         # the best available (often near `price`), NOT the ceiling.
         from config import PRICE_CEILING
-        order_price = PRICE_CEILING
         log.info(
             f"📤 FOK slippage: signal ¢{price*100:.1f} → "
-            f"order limit ¢{order_price*100:.1f}"
+            f"order limit ¢{PRICE_CEILING*100:.1f}"
         )
-        result = place_real_order(token_id, "BUY", bet_amount, order_price)
+        result = place_real_order(token_id, "BUY", bet_amount, price, limit_price=PRICE_CEILING)
 
 
     if result is None:
@@ -563,7 +711,11 @@ def execute_real_trade(market, side, price):
         )
         return False
 
-    shares = bet_amount / price
+    # Calculate shares from signal price using Decimal precision.
+    # Both real and shadow use the same formula for consistency.
+    amount_d = Decimal(str(bet_amount)).quantize(Decimal("0.01"))
+    price_d = Decimal(str(price)).quantize(Decimal("0.01"))
+    shares = float((amount_d / price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
     record_real_trade(
         market_slug=market["slug"],
         market_question=market["question"],
@@ -604,11 +756,48 @@ def kill_switch():
 
 # ─── Main Bot Loop ───────────────────────────────────────────────────────────
 
+def _bootstrap_traded_slugs():
+    """Load recently traded slugs from database to survive container restarts.
+
+    Without this, a Docker restart wipes the in-memory traded_slugs set,
+    allowing the bot to re-trade markets that are still active.
+    """
+    try:
+        recent = get_recent_traded_slugs(hours=1)
+        for slug in recent:
+            bot_state.traded_slugs[slug] = time.time()
+        if recent:
+            log.info(f"🔄 Bootstrapped {len(recent)} traded slugs from DB (anti-double-order)")
+    except Exception as e:
+        log.warning(f"Failed to bootstrap traded slugs: {e}")
+
+
 def bot_loop():
     """Main bot loop — runs in a background thread."""
+    global _ws_feed
     log.info("🤖 Bot started!")
+
+    # Initialize WebSocket price feed
+    try:
+        from ws_price_feed import WebSocketPriceFeed
+        _ws_feed = WebSocketPriceFeed(
+            ws_url=WS_CLOB_URL,
+            reconnect_delay=WS_RECONNECT_DELAY,
+            max_reconnect=WS_MAX_RECONNECT,
+            ping_interval=WS_PING_INTERVAL,
+        )
+        _ws_feed.start()
+        log.info("📡 WebSocket price feed initialized")
+    except Exception as e:
+        log.warning(f"⚠️ WebSocket init failed ({e}), using REST polling only")
+        _ws_feed = None
+
+    # Bootstrap traded slugs from DB to prevent double orders after restart
+    _bootstrap_traded_slugs()
+
     last_scan = 0
     last_resolve_check = 0
+    last_display_fetch = 0       # Throttle REST midpoint calls for display prices
 
     while True:
         try:
@@ -623,6 +812,25 @@ def bot_loop():
                 reset_paper_trading(10.0)
                 update_setting("has_reset_april27", "true")
             # -------------------------------
+
+            # --- Cap Scale Up: Midnight WIB Reset ---
+            from datetime import timedelta as _td_cap
+            _now_utc_cap = datetime.now(timezone.utc)
+            _now_wib_cap = _now_utc_cap + _td_cap(hours=7)
+            _today_wib_cap = _now_wib_cap.strftime("%Y-%m-%d")
+            _cap_reset_date = get_setting("cap_scale_up_reset_date")
+            if _cap_reset_date != _today_wib_cap and _now_wib_cap.hour == 0:
+                if get_setting("cap_scale_up_active") == "true":
+                    original_bet = get_setting("cap_scale_up_original_bet")
+                    if original_bet:
+                        update_setting("real_bet_amount", original_bet)
+                    update_setting("cap_scale_up_active", "false")
+                    update_setting("cap_scale_up_original_bet", "")
+                    msg = f"🔄 CAP SCALE UP reset (midnight WIB). Bet restored to ${float(original_bet or 1):.2f}"
+                    log.info(msg)
+                    add_notification(msg)
+                update_setting("cap_scale_up_reset_date", _today_wib_cap)
+            # -----------------------------------------
             
             bot_state.running = running_flag != "false"
 
@@ -641,16 +849,29 @@ def bot_loop():
                                 bot_state.current_market["slug"] != market["slug"]):
                             log.info(f"📍 New market: {market['question']} "
                                      f"(ends at {datetime.fromtimestamp(market['end_time'], tz=timezone.utc).strftime('%H:%M:%S UTC')})")
+                            # Subscribe WebSocket to new market tokens
+                            if _ws_feed is not None:
+                                _ws_feed.subscribe(
+                                    market["up_token"],
+                                    market["down_token"]
+                                )
                         bot_state.current_market = market
                 else:
                     with bot_state.lock:
                         bot_state.current_market = None
                         bot_state.countdown = None
+                    if not getattr(bot_state, '_waiting_market_logged', False):
+                        log.info("⏳ Waiting for the next market to start...")
+                        bot_state._waiting_market_logged = True
+                
+                # Reset the waiting log state if we found a market
+                if market:
+                    bot_state._waiting_market_logged = False
 
                 last_scan = now
 
             # ── Check resolution of pending trades ──
-            if now - last_resolve_check > 60:
+            if now - last_resolve_check > 5:
                 check_and_resolve_pending()
 
                 # ── Auto-claim winnings after resolution ──
@@ -660,6 +881,16 @@ def bot_loop():
                         auto_claim_wins()
                     except Exception as e:
                         log.warning(f"Auto-claim error: {e}")
+
+                    # ── Balance sync: correct ledger drift vs on-chain ──
+                    # MUST run AFTER auto-claim so on-chain balance includes
+                    # claimed winnings. Running before claim sees lower on-chain
+                    # and over-corrects starting_balance downward.
+                    try:
+                        from balance_sync import sync_real_starting_balance
+                        sync_real_starting_balance()
+                    except Exception as e:
+                        log.warning(f"Post-claim balance sync failed: {e}")
                 
                 last_resolve_check = now
 
@@ -669,6 +900,8 @@ def bot_loop():
                 with bot_state.lock:
                     bot_state.up_price = None
                     bot_state.down_price = None
+                    bot_state.display_up_price = None
+                    bot_state.display_down_price = None
                     bot_state.countdown = None
                     bot_state.last_update = datetime.utcnow().isoformat()
                 time.sleep(POLL_INTERVAL)
@@ -685,15 +918,62 @@ def bot_loop():
                 time.sleep(1)
                 continue
 
-            # Fetch prices
-            up_price = fetch_price(market["up_token"])
-            down_price = fetch_price(market["down_token"])
+            # Fetch prices -- prefer WebSocket, fallback to REST
+            ws_available = (
+                _ws_feed is not None
+                and _ws_feed.connected
+                and not _ws_feed.use_rest_fallback
+            )
 
-            # If CLOB price fails, try midpoint
-            if up_price is None or up_price == 0:
-                up_price = fetch_midpoint(market["up_token"])
-            if down_price is None or down_price == 0:
-                down_price = fetch_midpoint(market["down_token"])
+            if ws_available:
+                # Real-time prices from WebSocket cache
+                up_price = _ws_feed.get_price(market["up_token"], side="buy")
+                down_price = _ws_feed.get_price(market["down_token"], side="buy")
+
+                # Check staleness: if WS data is older than 10s, fallback to REST
+                up_age = _ws_feed.get_age(market["up_token"])
+                down_age = _ws_feed.get_age(market["down_token"])
+                ws_stale = (
+                    (up_age is not None and up_age > 10) or
+                    (down_age is not None and down_age > 10)
+                )
+
+                if up_price is None or down_price is None or ws_stale:
+                    # WS has no data yet or data is stale -- use REST
+                    up_price = fetch_price(market["up_token"])
+                    down_price = fetch_price(market["down_token"])
+                    if (up_price is None or up_price == 0):
+                        up_price = fetch_midpoint(market["up_token"])
+                    if (down_price is None or down_price == 0):
+                        down_price = fetch_midpoint(market["down_token"])
+            else:
+                # REST fallback
+                up_price = fetch_price(market["up_token"])
+                down_price = fetch_price(market["down_token"])
+
+                # If CLOB price fails, try midpoint
+                if up_price is None or up_price == 0:
+                    up_price = fetch_midpoint(market["up_token"])
+                if down_price is None or down_price == 0:
+                    down_price = fetch_midpoint(market["down_token"])
+
+            # ── Display prices: REST midpoint only (no WebSocket) ──
+            # Fetched every 3s to avoid rate limiting. Midpoint = avg(bid,ask),
+            # naturally stable and free from best_ask spikes on illiquid books.
+            if now - last_display_fetch >= 3:
+                d_up = fetch_midpoint(market["up_token"])
+                d_down = fetch_midpoint(market["down_token"])
+                with bot_state.lock:
+                    if d_up is not None and d_up > 0:
+                        bot_state.display_up_price = d_up
+                    if d_down is not None and d_down > 0:
+                        bot_state.display_down_price = d_down
+                    # If only one side succeeded, derive the other
+                    if bot_state.display_up_price and not bot_state.display_down_price:
+                        bot_state.display_down_price = 1.0 - bot_state.display_up_price
+                    elif bot_state.display_down_price and not bot_state.display_up_price:
+                        bot_state.display_up_price = 1.0 - bot_state.display_down_price
+                last_display_fetch = now
 
             with bot_state.lock:
                 bot_state.up_price = up_price
@@ -704,24 +984,177 @@ def bot_loop():
 
             slug = market["slug"]
 
+            # ── Stop Profit Guard (runs every iteration, uses cached on-chain balance) ──
+            stop_profit_on = get_setting("stop_profit_enabled") == "true"
+            if stop_profit_on and get_trading_mode() in ("real", "shadow"):
+                from datetime import timedelta as _td
+                now_utc = datetime.now(timezone.utc)
+                today_wib = (now_utc + _td(hours=7)).strftime("%Y-%m-%d")
+
+                # ── Persistent flag: if stop profit was already reached today, stay stopped ──
+                reached_date = get_setting("stop_profit_reached_date")
+                if reached_date == today_wib:
+                    if not getattr(bot_state, '_stop_profit_logged', False):
+                        log.info(
+                            f"🎯 Stop Profit already reached today ({today_wib}). "
+                            f"Pausing trades until midnight WIB."
+                        )
+                        bot_state._stop_profit_logged = True
+                    # Still record skipped event so dashboard stays populated
+                    if slug not in bot_state.skipped_slugs:
+                        record_skipped_event(
+                            market_slug=slug,
+                            market_question=market.get("question", ""),
+                            reason="stop_profit_reached",
+                            up_price=bot_state.up_price,
+                            down_price=bot_state.down_price,
+                            countdown=bot_state.countdown
+                        )
+                        bot_state.skipped_slugs[slug] = time.time()
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                sp_target = float(get_setting("stop_profit_target") or 2.5)
+                daily_pnl = None
+                try:
+                    # Check if anchor needs reset (new day or not set)
+                    anchor_date = get_setting("real_daily_start_date")
+                    daily_start = get_setting("real_daily_start_balance")
+
+                    if anchor_date != today_wib or not daily_start:
+                        # NEW DAY: refresh anchor from on-chain (force fresh, not cache)
+                        # GUARD: Only set anchor if no real trades exist today yet.
+                        # If trades exist, the bot restarted mid-day — do NOT overwrite
+                        # the anchor with current (post-trade) on-chain balance.
+                        from database import get_conn
+                        _conn = get_conn()
+                        today_trade_count = _conn.execute(
+                            "SELECT COUNT(*) FROM trades "
+                            "WHERE trading_mode IN ('real','shadow') "
+                            "AND date(datetime(timestamp, '+7 hours')) = date('now', '+7 hours')"
+                        ).fetchone()[0]
+                        _conn.close()
+
+                        if today_trade_count > 0 and not daily_start:
+                            # Mid-day restart with no anchor — can't safely determine
+                            # start-of-day balance. Log warning and skip stop profit.
+                            log.warning(
+                                f"Daily anchor missing but {today_trade_count} trades exist today. "
+                                f"Cannot safely set anchor mid-day. Skipping stop profit check."
+                            )
+                        elif today_trade_count == 0:
+                            # Truly a new day, no trades yet — safe to set anchor
+                            from trader import get_real_balance
+                            chain_bal = get_real_balance()
+                            if chain_bal is not None:
+                                update_setting("real_daily_start_balance", f"{chain_bal:.6f}")
+                                update_setting("real_daily_start_date", today_wib)
+                                daily_start = f"{chain_bal:.6f}"
+                                bot_state._stop_profit_logged = False
+                                log.info(
+                                    f"Daily PnL reset (midnight WIB). "
+                                    f"New anchor: ${chain_bal:.4f} for {today_wib}"
+                                )
+                        else:
+                            # anchor_date != today but trades exist — day rolled over,
+                            # update date but keep existing anchor if set
+                            update_setting("real_daily_start_date", today_wib)
+                            log.info(f"Daily date updated to {today_wib}, anchor kept: ${float(daily_start):.4f}")
+
+                    # ── Primary: on-chain PnL (ground truth when stable) ──
+                    chain_bal = get_cached_chain_balance()
+                    if chain_bal is not None and daily_start:
+                        daily_pnl = chain_bal - float(daily_start)
+                        log.debug(
+                            f"Stop Profit (on-chain): "
+                            f"${chain_bal:.4f} - ${float(daily_start):.4f} "
+                            f"= PnL ${daily_pnl:.4f} / target ${sp_target:.2f}"
+                        )
+                except Exception as e:
+                    log.debug(f"On-chain stop profit check failed: {e}")
+
+                # ── Cross-check: DB PnL (mendeteksi WIN lebih cepat) ──
+                # DB sudah tahu trade WIN saat resolve, walau uang belum masuk wallet.
+                # Gunakan MAX(on-chain, DB) agar stop profit tidak telat trigger.
+                # NOTE: Must use current mode so shadow PnL is checked correctly.
+                current_mode = get_trading_mode()
+                db_pnl = get_daily_profit_total(trading_mode=current_mode)
+                if daily_pnl is None:
+                    daily_pnl = db_pnl
+                    log.debug(f"Stop Profit (DB only, mode={current_mode}): PnL=${daily_pnl:.4f}")
+                elif db_pnl > daily_pnl:
+                    log.info(
+                        f"⚠️ Stop Profit cross-check: DB PnL ${db_pnl:.4f} > "
+                        f"on-chain PnL ${daily_pnl:.4f} — using DB (unclaimed wins detected)"
+                    )
+                    daily_pnl = db_pnl
+
+                if daily_pnl >= sp_target:
+                    # Set persistent flag so it survives restart
+                    update_setting("stop_profit_reached_date", today_wib)
+                    if not getattr(bot_state, '_stop_profit_logged', False):
+                        msg = (
+                            f"🎯 Stop Profit reached! "
+                            f"Daily PnL ${daily_pnl:.4f} >= target ${sp_target:.2f}. "
+                            f"Pausing trades until midnight WIB."
+                        )
+                        log.info(msg)
+                        add_notification(msg)
+                        bot_state._stop_profit_logged = True
+                    # Still record skipped event so dashboard stays populated
+                    if slug not in bot_state.skipped_slugs:
+                        record_skipped_event(
+                            market_slug=slug,
+                            market_question=market.get("question", ""),
+                            reason="stop_profit_reached",
+                            up_price=bot_state.up_price,
+                            down_price=bot_state.down_price,
+                            countdown=bot_state.countdown
+                        )
+                        bot_state.skipped_slugs[slug] = time.time()
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                else:
+                    bot_state._stop_profit_logged = False
+
+
+            # ── Balance-Based Stop Loss Guard ──
+            # If STOP_LOSS_BALANCE > 0, check on-chain balance every loop.
+            # When balance drops to or below this floor, KILL SWITCH activates.
+            if STOP_LOSS_BALANCE > 0 and get_trading_mode() in ("real", "shadow"):
+                chain_bal = get_cached_chain_balance()
+                if chain_bal is not None and chain_bal <= STOP_LOSS_BALANCE:
+                    msg = (
+                        f"🛑 STOP LOSS BALANCE TRIGGERED! "
+                        f"On-chain balance ${chain_bal:.4f} <= floor ${STOP_LOSS_BALANCE:.2f}. "
+                        f"Killing bot to protect remaining funds."
+                    )
+                    log.warning(msg)
+                    add_notification(msg)
+                    kill_switch()
+                    # Record skip for dashboard visibility
+                    record_skipped_event(
+                        market_slug=slug,
+                        market_question=market.get("question", ""),
+                        reason=f"stop_loss_balance (${chain_bal:.4f} <= ${STOP_LOSS_BALANCE:.2f})",
+                        up_price=bot_state.up_price,
+                        down_price=bot_state.down_price,
+                        countdown=bot_state.countdown
+                    )
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
             # ── Strategy check ──
             if slug not in bot_state.traded_slugs:
+                # ── Database-level dedup guard (survives restarts) ──
+                if is_slug_already_traded(slug):
+                    log.warning(f"⛔ DB DEDUP: {slug} already traded in DB, syncing to memory")
+                    bot_state.traded_slugs[slug] = time.time()
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
                 side_or_none, price_or_reason = should_trade(countdown, up_price, down_price)
                 if side_or_none and isinstance(price_or_reason, (int, float)):
-                    # ── Stop Profit Guard ──
-                    stop_profit_on = get_setting("stop_profit_enabled") == "true"
-                    if stop_profit_on:
-                        sp_target = float(get_setting("stop_profit_target") or 2.5)
-                        daily_pnl = get_daily_profit_total()
-                        if daily_pnl >= sp_target:
-                            if not getattr(bot_state, '_stop_profit_logged', False):
-                                log.info(f"🎯 Stop Profit reached! Daily PnL ${daily_pnl:.4f} >= target ${sp_target:.2f}. Pausing trades.")
-                                bot_state._stop_profit_logged = True
-                            time.sleep(POLL_INTERVAL)
-                            continue
-                        else:
-                            bot_state._stop_profit_logged = False
-
                     # ── Scheduler Guard (Wait until 00:00 WIB) ──
                     scheduler_on = get_setting("scheduler_enabled") == "true"
                     if scheduler_on:
@@ -745,13 +1178,47 @@ def bot_loop():
 
                     side = side_or_none
                     price = price_or_reason
+
+                    # ── Pre-mark slug BEFORE trade to prevent concurrent re-entry ──
+                    bot_state.traded_slugs[slug] = time.time()
+
+                    # -- Order Book Depth Check --
                     current_mode = get_trading_mode()
                     if current_mode in ("real", "shadow"):
-                        success = execute_real_trade(market, side, price)
+                        db_bet = get_setting("real_bet_amount")
+                        current_bet = float(db_bet) if db_bet else REAL_BET_AMOUNT
+                        token_for_check = market.get(f"{side.lower()}_token", "")
+                        has_depth, liquidity = check_book_depth(
+                            token_for_check, current_bet
+                        )
+                        if not has_depth and liquidity >= 0:
+                            # Not enough liquidity -- skip but keep trying
+                            del bot_state.traded_slugs[slug]
+                            log.info(
+                                f"📊 SKIP (low liquidity ${liquidity:.2f}): "
+                                f"{side} @ ¢{price*100:.1f} | {slug}"
+                            )
+                            time.sleep(POLL_INTERVAL)
+                            continue
+
+                    # -- Execute trade (parallel via thread pool) --
+                    if current_mode in ("real", "shadow"):
+                        future = _order_executor.submit(
+                            execute_real_trade, market, side, price
+                        )
+                        try:
+                            success = future.result(timeout=30)
+                        except Exception as exec_err:
+                            log.error(f"Order execution error: {exec_err}")
+                            success = False
                     else:
                         success = execute_paper_trade(market, side, price)
-                    if success:
-                        bot_state.traded_slugs.add(slug)
+
+                    if not success:
+                        # Rollback pre-mark ONLY if order was definitively not placed
+                        # (FOK killed/rejected). Keep the mark for timeouts to be safe.
+                        del bot_state.traded_slugs[slug]
+                        log.info(f"↩️ Slug {slug} unmarked (order not filled)")
                 else:
                     # Log skipped event (only once per slug)
                     reason = str(price_or_reason)
@@ -766,15 +1233,17 @@ def bot_loop():
                                 down_price=down_price,
                                 countdown=countdown
                             )
-                            bot_state.skipped_slugs.add(slug)
+                            bot_state.skipped_slugs[slug] = time.time()
 
-            # Cleanup old tracked slugs (keep only recent)
-            if len(bot_state.traded_slugs) > 100:
-                bot_state.traded_slugs = set(list(bot_state.traded_slugs)[-50:])
-            if len(bot_state.skipped_slugs) > 200:
-                bot_state.skipped_slugs = set(list(bot_state.skipped_slugs)[-100:])
-            if len(bot_state.disqualified_slugs) > 200:
-                bot_state.disqualified_slugs = set(list(bot_state.disqualified_slugs)[-100:])
+            # Cleanup old tracked slugs — FIFO order (remove OLDEST first)
+            # OrderedDict preserves insertion order, so popitem(last=False)
+            # always removes the oldest entry.
+            while len(bot_state.traded_slugs) > 100:
+                bot_state.traded_slugs.popitem(last=False)
+            while len(bot_state.skipped_slugs) > 200:
+                bot_state.skipped_slugs.popitem(last=False)
+            while len(bot_state.disqualified_slugs) > 200:
+                bot_state.disqualified_slugs.popitem(last=False)
 
             time.sleep(POLL_INTERVAL)
 

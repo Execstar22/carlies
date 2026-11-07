@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PolyBots — BTC Up/Down Trading Dashboard</title>
+    <title>{{ project_title }}</title>
     <meta name="description"
         content="Automated Polymarket BTC Up/Down paper trading bot dashboard with live market data, PnL tracking, and projections.">
     <link rel="stylesheet" href="/static/style.css">
@@ -19,7 +19,7 @@
         <aside class="side-menu" id="sideMenu">
             <div class="side-menu-top">
                 <button class="side-collapse-btn" id="sideCollapseBtn" onclick="toggleSideMenu()">☰</button>
-                <span class="side-title">PolyBots</span>
+                <span class="side-title">{{ project_title }}</span>
             </div>
             <nav class="side-nav">
                 <button class="side-nav-btn active" id="navDashboard" onclick="switchView('dashboard')">Dashboard</button>
@@ -154,7 +154,7 @@
                     <div class="form-group">
                         <label class="form-label" for="capitalInput">Bet Amount per Trade (USD)</label>
                         <input type="number" id="capitalInput" class="form-input" value="0.50" min="0.01"
-                            step="0.01" max="5.00" placeholder="0.50">
+                            step="0.01" placeholder="0.50">
                     </div>
                     <!-- Shadow Balance (Only shown in Shadow mode) -->
                     <div class="form-group" id="shadowBalanceGroup" style="display:none; margin-top:var(--space-md);">
@@ -193,6 +193,25 @@
                             <button class="btn" id="schedulerToggleBtn" onclick="toggleScheduler()"
                                 style="padding:2px 10px; font-size:0.75rem; min-width:50px;">OFF</button>
                         </div>
+                    </div>
+
+                    <!-- Cap Scale Up -->
+                    <div style="margin-top:var(--space-sm); padding:var(--space-sm); background:var(--bg-tertiary); border-radius:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                            <div style="display:flex; align-items:center; gap:6px;">
+                                <label class="form-label" style="margin:0;">📈 Cap Scale Up</label>
+                                <span id="capScaleUpActiveBadge" style="display:none; font-size:0.65rem; padding:1px 6px; border-radius:4px; background:#f59e0b; color:#000; font-weight:700;">⚡ ACTIVE</span>
+                            </div>
+                            <button class="btn" id="capScaleUpToggleBtn" onclick="toggleCapScaleUp()"
+                                style="padding:2px 10px; font-size:0.75rem; min-width:50px;">OFF</button>
+                        </div>
+                        <div style="display:flex; gap:6px; align-items:center;">
+                            <span style="color:var(--text-secondary); font-size:0.8rem; white-space:nowrap;">Bet $</span>
+                            <input type="number" id="capScaleUpAmountInput" class="form-input" value="5.00" min="0.10"
+                                step="0.50" placeholder="5.00" style="flex:1;">
+                            <button class="btn btn-outline" onclick="applyCapScaleUpAmount()" style="flex:0 0 auto; padding:4px 10px; font-size:0.75rem;">Apply</button>
+                        </div>
+                        <small style="color:var(--text-secondary); font-size:0.7rem;">Otomatis naikkan bet saat loss. Reset saat manual bet change atau midnight WIB.</small>
                     </div>
 
                     <div class="btn-group" style="margin-top:var(--space-md);">
@@ -1142,8 +1161,13 @@
                             return;
                         }
 
-                        const upPrice = data.up_price !== null ? data.up_price : null;
-                        const downPrice = data.down_price !== null ? data.down_price : null;
+                        // Display prices: use dedicated REST midpoint prices (stable, no WS flicker).
+                        // Falls back to raw trading prices only if display prices not yet available.
+                        let upPrice = data.display_up_price !== null ? data.display_up_price
+                                    : (data.up_price !== null ? data.up_price : null);
+                        let downPrice = data.display_down_price !== null ? data.display_down_price
+                                      : (data.down_price !== null ? data.down_price : null);
+
                         const countdown = data.countdown_display || '--:--';
                         const countdownSec = data.countdown || 0;
 
@@ -1323,6 +1347,34 @@
                 });
             };
 
+            window.toggleCapScaleUp = function() {
+                fetch('/api/settings').then(r => r.json()).then(s => {
+                    const newVal = !s.cap_scale_up_enabled;
+                    fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ cap_scale_up_enabled: newVal })
+                    }).then(() => {
+                        toast('Cap Scale Up ' + (newVal ? 'ON' : 'OFF' + (s.cap_scale_up_active ? ' (bet restored)' : '')));
+                        syncFeatureToggles();
+                        if (!newVal) updateStats();
+                    });
+                });
+            };
+
+            window.applyCapScaleUpAmount = function() {
+                const val = parseFloat(document.getElementById('capScaleUpAmountInput').value);
+                if (isNaN(val) || val <= 0) return toast('Invalid cap scale up amount', 'error');
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ cap_scale_up_amount: val, cap_scale_up_enabled: true })
+                }).then(() => {
+                    toast('Cap Scale Up amount set to $' + val.toFixed(2) + ' (ON)');
+                    syncFeatureToggles();
+                }).catch(() => toast('Error', 'error'));
+            };
+
             function syncFeatureToggles() {
                 fetch('/api/settings').then(r => r.json()).then(s => {
                     const spBtn = document.getElementById('stopProfitToggleBtn');
@@ -1340,6 +1392,20 @@
                         schBtn.style.background = s.scheduler_enabled ? '#10b981' : 'var(--bg-tertiary)';
                         schBtn.style.color = s.scheduler_enabled ? '#fff' : 'var(--text-secondary)';
                     }
+                    // Cap Scale Up toggle + active badge
+                    const csBtn = document.getElementById('capScaleUpToggleBtn');
+                    if (csBtn) {
+                        csBtn.textContent = s.cap_scale_up_enabled ? 'ON' : 'OFF';
+                        csBtn.style.background = s.cap_scale_up_enabled ? '#10b981' : 'var(--bg-tertiary)';
+                        csBtn.style.color = s.cap_scale_up_enabled ? '#fff' : 'var(--text-secondary)';
+                    }
+                    if (document.activeElement !== document.getElementById('capScaleUpAmountInput')) {
+                        document.getElementById('capScaleUpAmountInput').value = (s.cap_scale_up_amount || 5).toFixed(2);
+                    }
+                    const csBadge = document.getElementById('capScaleUpActiveBadge');
+                    if (csBadge) {
+                        csBadge.style.display = s.cap_scale_up_active ? 'inline' : 'none';
+                    }
                 });
             }
 
@@ -1349,8 +1415,9 @@
                     toast('Please enter a valid bet amount', 'error');
                     return;
                 }
-                if (val > 100.00) {
-                    toast('Max bet amount is $100.00 (safety limit)', 'error');
+                const maxBet = parseFloat(document.getElementById('capitalInput').getAttribute('max')) || 99999;
+                if (val > maxBet) {
+                    toast('Max bet amount is $' + maxBet.toFixed(2) + ' (safety limit)', 'error');
                     return;
                 }
                 if (!confirm(`Set bet amount to $${val.toFixed(2)} per trade?`)) return;
@@ -1363,6 +1430,13 @@
                     .then(r => r.json())
                     .then(() => {
                         toast(`Bet amount updated to $${val.toFixed(2)}`);
+                        // Check if cap scale up was active and notify user it was cancelled
+                        fetch('/api/settings').then(r => r.json()).then(s => {
+                            if (!s.cap_scale_up_active) {
+                                // Was just cancelled by the POST above
+                            }
+                            syncFeatureToggles();
+                        });
                         refreshAll();
                     })
                     .catch(() => toast('Error updating bet amount', 'error'));
@@ -1450,7 +1524,7 @@
 
             // ─── Reset History ───────────────────────────────────────────────────
             window.resetHistory = function () {
-                if (!confirm('🗑️ RESET ALL HISTORY\n\nThis will permanently delete:\n• All trade records\n• All skipped events\n\nAre you sure?')) return;
+                if (!confirm('🗑️ RESET ALL HISTORY\n\nThis will permanently delete:\n• All trade records\n• All skipped events\n• Stop Profit reached flag\n• Daily PnL anchor\n• Cap Scale Up state\n• In-memory caches\n\nBot will resume trading immediately.\nAre you sure?')) return;
                 if (!confirm('⚠️ FINAL CONFIRMATION\n\nType OK below to confirm deletion.')) return;
                 fetch('/api/reset', {
                     method: 'POST',
@@ -1459,7 +1533,7 @@
                 })
                     .then(r => r.json())
                     .then(() => {
-                        toast('🗑️ All history cleared');
+                        toast('🗑️ All history & flags cleared — bot resuming');
                         refreshAll();
                     })
                     .catch(() => toast('Error resetting', 'error'));
@@ -1971,6 +2045,9 @@
                 .then(r => r.json())
                 .then(s => {
                     document.getElementById('capitalInput').value = s.capital;
+                    if (s.max_bet_amount) {
+                        document.getElementById('capitalInput').setAttribute('max', s.max_bet_amount);
+                    }
                     if (s.theme && s.theme !== currentTheme) {
                         currentTheme = s.theme;
                         document.documentElement.setAttribute('data-theme', currentTheme);

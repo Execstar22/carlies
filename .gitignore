@@ -6,7 +6,7 @@
 __pycache__/
 
 # Database
-polybots.db
+*.db
 
 # Debug logs
 debug-*.log
@@ -14,3 +14,10 @@ debug-*.log
 # IDE
 .cursor/
 .vscode/
+
+# Local-only / backup files
+*.exe
+TRADEDB/
+*.txt
+polybotsBACKUP*.db
+polybotsSIANG.db

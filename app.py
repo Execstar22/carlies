@@ -12,7 +12,7 @@ from database import (
     get_trades_filtered, get_skipped_events_filtered, get_projection_chart_data
 )
 from bot import bot_state, kill_switch
-from config import BET_AMOUNT, TRADING_MODE, REAL_BET_AMOUNT, get_trading_mode, COUNTDOWN_BUY_START
+from config import BET_AMOUNT, TRADING_MODE, REAL_BET_AMOUNT, MAX_BET_AMOUNT, get_trading_mode, COUNTDOWN_BUY_START, DEFAULT_CAPITAL
 
 app = Flask(__name__)
 
@@ -38,7 +38,9 @@ def _agent_log(hypothesisId, message, data=None, runId="pre-fix"):
 @app.route("/")
 def index():
     """Serve the dashboard page."""
-    return render_template("index.html")
+    import os
+    project_title = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+    return render_template("index.html", project_title=project_title)
 
 
 @app.route("/api/stats")
@@ -117,10 +119,14 @@ def api_get_settings():
         "theme": get_setting("theme") or "dark",
         "trading_mode": get_trading_mode(),
         "real_bet_amount": float(get_setting("real_bet_amount") or REAL_BET_AMOUNT),
+        "max_bet_amount": MAX_BET_AMOUNT,
         "shadow_capital": float(get_setting("shadow_capital") or 10.0),
         "stop_profit_enabled": get_setting("stop_profit_enabled") == "true",
         "stop_profit_target": float(get_setting("stop_profit_target") or 2.5),
         "scheduler_enabled": get_setting("scheduler_enabled") == "true",
+        "cap_scale_up_enabled": get_setting("cap_scale_up_enabled") != "false",
+        "cap_scale_up_active": get_setting("cap_scale_up_active") == "true",
+        "cap_scale_up_amount": float(get_setting("cap_scale_up_amount") or 5.0),
     })
 
 
@@ -138,6 +144,10 @@ def api_update_settings():
         # In live mode, capital = bet amount per trade
         update_setting("real_bet_amount", f"{new_capital:.4f}")
         update_setting("capital", f"{new_capital:.6f}")
+        # Manual bet change cancels Cap Scale Up
+        if get_setting("cap_scale_up_active") == "true":
+            update_setting("cap_scale_up_active", "false")
+            update_setting("cap_scale_up_original_bet", "")
 
     if "shadow_capital" in data:
         new_shadow = float(data["shadow_capital"])
@@ -168,6 +178,22 @@ def api_update_settings():
 
     if "scheduler_enabled" in data:
         update_setting("scheduler_enabled", "true" if data["scheduler_enabled"] else "false")
+
+    if "cap_scale_up_enabled" in data:
+        enabled = bool(data["cap_scale_up_enabled"])
+        update_setting("cap_scale_up_enabled", "true" if enabled else "false")
+        # If disabling, also deactivate any active cap scale up and restore bet
+        if not enabled and get_setting("cap_scale_up_active") == "true":
+            original_bet = get_setting("cap_scale_up_original_bet")
+            if original_bet:
+                update_setting("real_bet_amount", original_bet)
+            update_setting("cap_scale_up_active", "false")
+            update_setting("cap_scale_up_original_bet", "")
+
+    if "cap_scale_up_amount" in data:
+        val = float(data["cap_scale_up_amount"])
+        if val > 0:
+            update_setting("cap_scale_up_amount", f"{val:.4f}")
 
     return jsonify({"status": "ok"})
 
@@ -207,16 +233,67 @@ def api_reset():
     confirm = data.get("confirm")
     if confirm != "RESET":
         return jsonify({"error": "Send {\"confirm\": \"RESET\"} to confirm"}), 400
+
+    mode = get_trading_mode()
+
+    # In real mode, sync real_starting_balance with on-chain balance BEFORE
+    # clearing history so the ledger chain re-anchors correctly.
+    if mode == "real":
+        try:
+            from trader import get_real_balance
+            real_bal = get_real_balance()
+            if real_bal is not None:
+                update_setting("real_starting_balance", f"{real_bal:.6f}")
+            else:
+                # Fallback: can't reach chain — warn but allow reset
+                import logging
+                logging.getLogger("app").warning(
+                    "Cannot fetch on-chain balance during reset; "
+                    "real_starting_balance may be stale"
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger("app").warning(f"Reset balance sync failed: {e}")
+
     from database import get_conn
     conn = get_conn()
     conn.execute("DELETE FROM trades")
     conn.execute("DELETE FROM skipped_events")
     conn.commit()
     conn.close()
-    update_setting("current_balance", "0")
-    update_setting("capital", "0.50")
-    update_setting("shadow_balance", get_setting("shadow_capital") or "10.0")
-    return jsonify({"status": "ok", "message": "All history cleared"})
+
+    if mode == "real":
+        # Don't touch paper balance fields; just ensure capital reflects
+        # the current real bet amount for stats display.
+        pass
+    elif mode == "shadow":
+        update_setting("shadow_balance", get_setting("shadow_capital") or "10.0")
+    else:
+        update_setting("current_balance", str(DEFAULT_CAPITAL))
+        update_setting("capital", str(DEFAULT_CAPITAL))
+
+    # ── Clear all runtime flags so bot doesn't stay stuck ──
+    # Stop Profit: clear today's reached flag so bot resumes trading
+    update_setting("stop_profit_reached_date", "")
+    # Daily PnL anchor: clear so it re-anchors fresh on next cycle
+    update_setting("real_daily_start_balance", "")
+    update_setting("real_daily_start_date", "")
+    # Cap Scale Up: deactivate and restore original bet
+    if get_setting("cap_scale_up_active") == "true":
+        original_bet = get_setting("cap_scale_up_original_bet")
+        if original_bet:
+            update_setting("real_bet_amount", original_bet)
+        update_setting("cap_scale_up_active", "false")
+        update_setting("cap_scale_up_original_bet", "")
+
+    # Clear in-memory bot state caches
+    bot_state.traded_slugs.clear()
+    bot_state.skipped_slugs.clear()
+    bot_state.disqualified_slugs.clear()
+    bot_state.notifications.clear()
+    bot_state._stop_profit_logged = False
+
+    return jsonify({"status": "ok", "message": "All history and flags cleared"})
 
 
 @app.route("/api/claim", methods=["POST"])
@@ -245,14 +322,48 @@ def api_claims_status():
 @app.route("/api/projection")
 def api_projection():
     """
-    Calculate PnL projection based on historical performance
-    with a custom capital amount.
+    Calculate PnL projection based on today's performance only (UTC+7).
     """
+    from datetime import datetime, timedelta, timezone
+
     custom_capital = request.args.get("capital", 5.0, type=float)
     stats = get_stats()
     trades = get_trades(limit=10000)
 
-    if stats["total_trades"] == 0 or (stats["wins"] + stats["losses"]) == 0:
+    tz_utc_7 = timezone(timedelta(hours=7))
+    now_local = datetime.now(timezone.utc).astimezone(tz_utc_7)
+    today_date = now_local.date()
+
+    resolved_today = []
+    wins = 0
+    losses = 0
+
+    for t in trades:
+        if t.get("result") == "PENDING":
+            continue
+
+        if "timestamp" not in t:
+            continue
+
+        try:
+            dt = datetime_from_iso(t["timestamp"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            
+            dt_local = dt.astimezone(tz_utc_7)
+            if dt_local.date() == today_date:
+                resolved_today.append(t)
+                res = t.get("result")
+                if res == "WIN":
+                    wins += 1
+                elif res == "LOSS":
+                    losses += 1
+        except Exception:
+            pass
+
+    if not resolved_today:
         return jsonify({
             "custom_capital": custom_capital,
             "projected_pnl": 0,
@@ -268,53 +379,37 @@ def api_projection():
             "projected_monthly_pnl": 0,
         })
 
-    # Keep projection basis consistent with dashboard Total PnL (trade id >= 284).
-    resolved = [t for t in trades if t["result"] != "PENDING" and t.get("id", 0) >= 284]
-    starting = stats["starting_capital"]
+    total_resolved = len(resolved_today)
+    win_rate = round((wins / total_resolved) * 100, 2) if total_resolved > 0 else 0
 
-    if starting > 0:
-        total_return_pct = (stats["current_balance"] - starting) / starting
-    else:
-        total_return_pct = 0
-
-    projected_pnl = custom_capital * total_return_pct
-    projected_balance = custom_capital + projected_pnl
-
-    # Calculate average per-trade return percentage
+    # Calculate average per-trade return percentage for today
     trade_returns = []
-    for t in resolved:
-        if t["bet_amount"] > 0:
-            ret_pct = t["pnl"] / t["bet_amount"]
+    for t in resolved_today:
+        bet = t.get("bet_amount", 0)
+        if bet > 0:
+            ret_pct = t.get("pnl", 0) / bet
             trade_returns.append(ret_pct)
 
     avg_return_pct = sum(trade_returns) / len(trade_returns) if trade_returns else 0
 
-    # Estimate trade frequency
-    if len(resolved) >= 2:
-        timestamps = sorted([t["timestamp"] for t in resolved])
-        try:
-            first = datetime_from_iso(timestamps[0])
-            last = datetime_from_iso(timestamps[-1])
-            span_hours = max((last - first).total_seconds() / 3600, 1)
-            trades_per_hour = len(resolved) / span_hours
-            trades_per_day = trades_per_hour * 24
-        except Exception:
-            trades_per_day = len(resolved)
-    else:
-        trades_per_day = len(resolved)
-
-    # Scale bet size with custom capital so daily/weekly/monthly projections move
-    # when user changes "Custom Capital", while preserving current behavior at baseline.
+    # Scale bet size with custom capital
+    starting = stats.get("starting_capital", 0)
     baseline = starting if starting > 0 else custom_capital
     scale = (custom_capital / baseline) if baseline > 0 else 1.0
     bet_size = max(0.01, min(custom_capital, BET_AMOUNT * scale))
+    
     avg_pnl_per_trade = bet_size * avg_return_pct
+    trades_per_day = total_resolved
     projected_daily = avg_pnl_per_trade * trades_per_day
+
+    projected_pnl = projected_daily
+    projected_balance = custom_capital + projected_pnl
+    total_return_pct = projected_pnl / custom_capital if custom_capital > 0 else 0
 
     # #region agent log
     _agent_log(
         "H1",
-        "projection_calc",
+        "projection_calc_today_only",
         {
             "custom_capital": custom_capital,
             "starting_capital": starting,
@@ -325,6 +420,7 @@ def api_projection():
             "avg_return_pct": avg_return_pct,
             "trades_per_day": trades_per_day,
             "projected_daily": projected_daily,
+            "today_date": str(today_date)
         },
     )
     # #endregion agent log
@@ -334,8 +430,8 @@ def api_projection():
         "projected_pnl": round(projected_pnl, 4),
         "projected_balance": round(projected_balance, 4),
         "projected_roi": round(total_return_pct * 100, 2),
-        "win_rate": stats["win_rate"],
-        "total_resolved": len(resolved),
+        "win_rate": win_rate,
+        "total_resolved": total_resolved,
         "avg_return_pct": round(avg_return_pct * 100, 2),
         "projected_daily_trades": round(trades_per_day, 1),
         "projected_daily_pnl": round(projected_daily, 4),
